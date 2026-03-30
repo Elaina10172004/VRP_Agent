@@ -1,0 +1,261 @@
+from __future__ import annotations
+
+from .common import (
+    EPS,
+    build_vrp_distance_matrix,
+    clean_routes,
+    evaluate_cvrptw_route,
+    normalize_demands,
+    normalize_routes_payload,
+    normalize_service_times,
+    normalize_time_windows,
+    routes_to_raw_sequence,
+)
+
+
+def total_cvrptw_cost(
+    routes: list[list[int]],
+    distance_matrix: list[list[float]],
+    demands: list[float],
+    capacity: float,
+    time_windows: list[tuple[float, float]],
+    service_times: list[float],
+) -> float:
+    total = 0.0
+    for route in routes:
+        evaluation = evaluate_cvrptw_route(route, distance_matrix, demands, capacity, time_windows, service_times)
+        if not evaluation.feasible:
+            return float("inf")
+        total += evaluation.cost
+    return total
+
+
+def best_intra_route_two_opt(
+    routes: list[list[int]],
+    distance_matrix: list[list[float]],
+    demands: list[float],
+    capacity: float,
+    time_windows: list[tuple[float, float]],
+    service_times: list[float],
+) -> tuple[list[list[int]], float] | None:
+    best_delta = 0.0
+    best_routes: list[list[int]] | None = None
+    route_costs = [
+        evaluate_cvrptw_route(route, distance_matrix, demands, capacity, time_windows, service_times).cost
+        for route in routes
+    ]
+
+    for route_index, route in enumerate(routes):
+        if len(route) < 4:
+            continue
+        current_cost = route_costs[route_index]
+        for i in range(len(route) - 1):
+            for j in range(i + 1, len(route)):
+                candidate = route[:i] + list(reversed(route[i : j + 1])) + route[j + 1 :]
+                evaluation = evaluate_cvrptw_route(candidate, distance_matrix, demands, capacity, time_windows, service_times)
+                if not evaluation.feasible:
+                    continue
+                delta = evaluation.cost - current_cost
+                if delta < best_delta - EPS:
+                    updated = [list(item) for item in routes]
+                    updated[route_index] = candidate
+                    best_delta = delta
+                    best_routes = updated
+
+    if best_routes is None:
+        return None
+    return clean_routes(best_routes), best_delta
+
+
+def best_relocate_move(
+    routes: list[list[int]],
+    distance_matrix: list[list[float]],
+    demands: list[float],
+    capacity: float,
+    time_windows: list[tuple[float, float]],
+    service_times: list[float],
+) -> tuple[list[list[int]], float] | None:
+    best_delta = 0.0
+    best_routes: list[list[int]] | None = None
+    route_evaluations = [
+        evaluate_cvrptw_route(route, distance_matrix, demands, capacity, time_windows, service_times)
+        for route in routes
+    ]
+
+    for from_route_index, from_route in enumerate(routes):
+        for from_pos, customer in enumerate(from_route):
+            reduced_route = from_route[:from_pos] + from_route[from_pos + 1 :]
+            reduced_eval = evaluate_cvrptw_route(reduced_route, distance_matrix, demands, capacity, time_windows, service_times)
+            if not reduced_eval.feasible:
+                continue
+
+            for to_route_index, to_route in enumerate(routes):
+                insertion_base = reduced_route if from_route_index == to_route_index else to_route
+                for insert_pos in range(len(insertion_base) + 1):
+                    candidate_target = insertion_base[:insert_pos] + [customer] + insertion_base[insert_pos:]
+                    if from_route_index == to_route_index and candidate_target == from_route:
+                        continue
+
+                    candidate_eval = evaluate_cvrptw_route(candidate_target, distance_matrix, demands, capacity, time_windows, service_times)
+                    if not candidate_eval.feasible:
+                        continue
+
+                    if from_route_index == to_route_index:
+                        delta = candidate_eval.cost - route_evaluations[from_route_index].cost
+                    else:
+                        delta = (
+                            reduced_eval.cost
+                            + candidate_eval.cost
+                            - route_evaluations[from_route_index].cost
+                            - route_evaluations[to_route_index].cost
+                        )
+
+                    if delta < best_delta - EPS:
+                        updated = [list(route) for route in routes]
+                        moved_customer = updated[from_route_index].pop(from_pos)
+                        if from_route_index == to_route_index:
+                            adjusted_insert_pos = insert_pos
+                            if insert_pos > from_pos:
+                                adjusted_insert_pos -= 1
+                            updated[to_route_index].insert(adjusted_insert_pos, moved_customer)
+                        else:
+                            updated[to_route_index].insert(insert_pos, moved_customer)
+                        best_delta = delta
+                        best_routes = clean_routes(updated)
+
+    if best_routes is None:
+        return None
+    return best_routes, best_delta
+
+
+def best_swap_move(
+    routes: list[list[int]],
+    distance_matrix: list[list[float]],
+    demands: list[float],
+    capacity: float,
+    time_windows: list[tuple[float, float]],
+    service_times: list[float],
+) -> tuple[list[list[int]], float] | None:
+    best_delta = 0.0
+    best_routes: list[list[int]] | None = None
+    route_evaluations = [
+        evaluate_cvrptw_route(route, distance_matrix, demands, capacity, time_windows, service_times)
+        for route in routes
+    ]
+
+    for left_route_index in range(len(routes) - 1):
+        left_route = routes[left_route_index]
+        for right_route_index in range(left_route_index + 1, len(routes)):
+            right_route = routes[right_route_index]
+            for left_pos, left_customer in enumerate(left_route):
+                for right_pos, right_customer in enumerate(right_route):
+                    candidate_left = list(left_route)
+                    candidate_right = list(right_route)
+                    candidate_left[left_pos] = right_customer
+                    candidate_right[right_pos] = left_customer
+
+                    left_eval = evaluate_cvrptw_route(candidate_left, distance_matrix, demands, capacity, time_windows, service_times)
+                    if not left_eval.feasible:
+                        continue
+                    right_eval = evaluate_cvrptw_route(candidate_right, distance_matrix, demands, capacity, time_windows, service_times)
+                    if not right_eval.feasible:
+                        continue
+
+                    delta = (
+                        left_eval.cost
+                        + right_eval.cost
+                        - route_evaluations[left_route_index].cost
+                        - route_evaluations[right_route_index].cost
+                    )
+                    if delta < best_delta - EPS:
+                        updated = [list(route) for route in routes]
+                        updated[left_route_index] = candidate_left
+                        updated[right_route_index] = candidate_right
+                        best_delta = delta
+                        best_routes = clean_routes(updated)
+
+    if best_routes is None:
+        return None
+    return best_routes, best_delta
+
+
+def improve_cvrptw_solution(
+    instance: dict,
+    solution: dict,
+    config: dict | None = None,
+) -> dict:
+    config = dict(config or {})
+    depot_xy = instance["depot_xy"]
+    node_xy = instance["node_xy"]
+    demands = normalize_demands(instance["node_demand"])
+    capacity = float(instance["capacity"])
+    time_windows = normalize_time_windows(instance["node_tw"])
+    service_times = normalize_service_times(instance["service_time"], len(demands))
+    routes = normalize_routes_payload(solution)
+
+    distance_matrix = build_vrp_distance_matrix(depot_xy, node_xy)
+    operators = config.get("operators", ["two_opt", "relocate", "swap"])
+    max_rounds = int(config.get("max_rounds", 50))
+
+    current_routes = clean_routes(routes)
+    initial_distance = total_cvrptw_cost(current_routes, distance_matrix, demands, capacity, time_windows, service_times)
+    applied_operators: list[str] = []
+
+    for _ in range(max_rounds):
+        improved = False
+        for operator in operators:
+            if operator == "two_opt":
+                move = best_intra_route_two_opt(
+                    current_routes,
+                    distance_matrix,
+                    demands,
+                    capacity,
+                    time_windows,
+                    service_times,
+                )
+            elif operator == "relocate":
+                move = best_relocate_move(
+                    current_routes,
+                    distance_matrix,
+                    demands,
+                    capacity,
+                    time_windows,
+                    service_times,
+                )
+            elif operator == "swap":
+                move = best_swap_move(
+                    current_routes,
+                    distance_matrix,
+                    demands,
+                    capacity,
+                    time_windows,
+                    service_times,
+                )
+            else:
+                continue
+
+            if move is None:
+                continue
+
+            current_routes, _ = move
+            applied_operators.append(operator)
+            improved = True
+            break
+
+        if not improved:
+            break
+
+    final_distance = total_cvrptw_cost(current_routes, distance_matrix, demands, capacity, time_windows, service_times)
+    return {
+        "problem_type": "cvrptw",
+        "routes": current_routes,
+        "raw_sequence": routes_to_raw_sequence(current_routes),
+        "distance": final_distance,
+        "meta": {
+            "initial_distance": initial_distance,
+            "improved_distance": final_distance,
+            "improvement": initial_distance - final_distance,
+            "iterations": len(applied_operators),
+            "applied_operators": applied_operators,
+        },
+    }
