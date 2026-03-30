@@ -1,5 +1,5 @@
 {
-  "name": "react-example",
+  "name": "vrp-agent-desktop",
   "private": true,
   "version": "0.0.0",
   "main": "electron/main.cjs",

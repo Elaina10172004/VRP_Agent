@@ -6,10 +6,39 @@ const { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } = require('ele
 const isDev = process.env.OPTICHAT_DEV === 'true';
 const startUrl = process.env.OPTICHAT_START_URL || 'http://127.0.0.1:3000';
 const workspaceRoot = path.resolve(__dirname, '..', '..');
+const runtimeDefaultsPath = path.join(workspaceRoot, 'config', 'runtime_defaults.json');
 
-const GPU_BUDGET_MB = 6 * 1024;
-const FAST_SINGLE_INSTANCE_VRAM_MB = 91;
-const THINKING_SINGLE_INSTANCE_VRAM_MB = 123;
+function loadRuntimeDefaults() {
+  const fallback = {
+    gpuBudgetMb: 6 * 1024,
+    fastSingleInstanceVramMb: 91,
+    thinkingSingleInstanceVramMb: 123,
+  };
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(runtimeDefaultsPath, 'utf8'));
+    const gpuBudgetMb = Number.parseInt(String(raw.gpu_budget_mb), 10);
+    const fastSingleInstanceVramMb = Number.parseInt(String(raw.fast_single_instance_vram_mb), 10);
+    const thinkingSingleInstanceVramMb = Number.parseInt(String(raw.thinking_single_instance_vram_mb), 10);
+
+    if ([gpuBudgetMb, fastSingleInstanceVramMb, thinkingSingleInstanceVramMb].some((value) => !Number.isFinite(value) || value <= 0)) {
+      throw new Error('Invalid runtime defaults config');
+    }
+
+    return {
+      gpuBudgetMb,
+      fastSingleInstanceVramMb,
+      thinkingSingleInstanceVramMb,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+const runtimeDefaults = loadRuntimeDefaults();
+const GPU_BUDGET_MB = runtimeDefaults.gpuBudgetMb;
+const FAST_SINGLE_INSTANCE_VRAM_MB = runtimeDefaults.fastSingleInstanceVramMb;
+const THINKING_SINGLE_INSTANCE_VRAM_MB = runtimeDefaults.thinkingSingleInstanceVramMb;
 const FAST_DEFAULT_INSTANCE_PARALLELISM = Math.max(1, Math.floor(GPU_BUDGET_MB / FAST_SINGLE_INSTANCE_VRAM_MB));
 const THINKING_DEFAULT_INSTANCE_PARALLELISM = Math.max(1, Math.floor(GPU_BUDGET_MB / THINKING_SINGLE_INSTANCE_VRAM_MB));
 
@@ -25,15 +54,37 @@ const defaultSettings = Object.freeze({
   localSearchRounds: 50,
 });
 
+const ALLOWED_TOOL_PLAN_STEPS = new Set([
+  'construct_initial',
+  'validate_solution',
+  'reduce_vehicles',
+  'apply_lookahead',
+  'destroy_repair',
+  'improve_solution',
+  'compare_solutions',
+]);
+
+const ALLOWED_VRP_OPERATORS = new Set([
+  'two_opt',
+  'relocate',
+  'swap',
+  'or_opt',
+  'two_opt_star',
+  'cross_exchange',
+  'route_elimination',
+]);
+
 const agentDecisionPrompt = [
   'You are the orchestration agent for a desktop routing assistant.',
-  'Decide whether the local solve skill should be called.',
+  'Decide whether the local solve skill should be called, and optionally attach a solver strategy.',
   'Return JSON only. No markdown, no code fences, no commentary.',
   'If the user clearly wants solving, routing, optimization, improvement, DRL construction, lookahead, local search, or wants to solve the uploaded instance, return one of:',
   '1. {"action":"solve","payload":{...}}',
   '2. {"action":"solve","use_uploaded_payload":true}',
+  'You may also attach "solver_config" when returning solve. Example:',
+  '3. {"action":"solve","use_uploaded_payload":true,"solver_config":{"tool_plan":["construct_initial","validate_solution","reduce_vehicles","apply_lookahead","improve_solution","compare_solutions"],"enable_vehicle_reduction":true,"local_search_operators":["or_opt","relocate","swap","two_opt"]}}',
   'If the user is asking a general question, wants explanation, or is chatting, return:',
-  '3. {"action":"reply","message":"..."}',
+  '4. {"action":"reply","message":"..."}',
   'Never choose solve unless the intent is clearly to solve or optimize.',
   'When you return a payload, the top-level object must contain "problem_type" and "instance".',
   'Supported payloads:',
@@ -41,6 +92,20 @@ const agentDecisionPrompt = [
   'CVRP: {"problem_type":"cvrp","instance":{"depot_xy":[x,y],"node_xy":[[x,y],...],"node_demand":[...],"capacity":number}}',
   'CVRPTW: {"problem_type":"cvrptw","instance":{"depot_xy":[x,y],"node_xy":[[x,y],...],"node_demand":[...],"capacity":number,"node_tw":[[start,end],...],"service_time":number|[...],"grid_scale":number}}',
   'If information is insufficient for solving, prefer {"action":"reply","message":"..."} and explain what is missing.',
+].join('\n');
+
+const solverStrategyPrompt = [
+  'You choose a local tool plan for a routing solver orchestrator.',
+  'Return JSON only. No markdown.',
+  'Format: {"solver_config":{...}}',
+  'Allowed tool_plan steps: construct_initial, validate_solution, reduce_vehicles, apply_lookahead, destroy_repair, improve_solution, compare_solutions.',
+  'Allowed operators: two_opt, relocate, swap, or_opt, two_opt_star, cross_exchange, route_elimination.',
+  'Every plan must start with construct_initial and end with compare_solutions.',
+  'Insert validate_solution after each major action.',
+  'For TSP never use reduce_vehicles or route_elimination.',
+  'For CVRP and CVRPTW you may use reduce_vehicles and route_elimination.',
+  'Prefer compact plans. Only enable expensive steps when they are likely to help.',
+  'If the user explicitly wants speed, keep the plan short.',
 ].join('\n');
 
 const conversationTitlePrompt = [
@@ -305,9 +370,116 @@ function emitProgress(sender, requestId, stepId, label, status, detail = null) {
   });
 }
 
-function withSolveDefaults(payload, mode, settings) {
-  const rawConfig = payload.config && typeof payload.config === 'object' ? payload.config : {};
+function buildRuntimeDefaultsPayload() {
+  return {
+    gpuBudgetMb: GPU_BUDGET_MB,
+    fastSingleInstanceVramMb: FAST_SINGLE_INSTANCE_VRAM_MB,
+    thinkingSingleInstanceVramMb: THINKING_SINGLE_INSTANCE_VRAM_MB,
+    fastMaxParallelInstances: FAST_DEFAULT_INSTANCE_PARALLELISM,
+    thinkingMaxParallelInstances: THINKING_DEFAULT_INSTANCE_PARALLELISM,
+  };
+}
+
+function normalizeOperatorList(value) {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const normalized = value
+    .map((item) => String(item || '').trim().toLowerCase())
+    .filter((item) => ALLOWED_VRP_OPERATORS.has(item));
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeToolPlan(value, quickMode) {
+  if (quickMode) {
+    return ['construct_initial', 'validate_solution', 'compare_solutions'];
+  }
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const normalized = value
+    .map((item) => String(item || '').trim())
+    .filter((item) => ALLOWED_TOOL_PLAN_STEPS.has(item));
+
+  if (normalized.length === 0) {
+    return undefined;
+  }
+  if (normalized[0] !== 'construct_initial' || normalized[normalized.length - 1] !== 'compare_solutions') {
+    return undefined;
+  }
+  return normalized;
+}
+
+function normalizeSolverConfig(value, quickMode) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  const normalized = {};
+  const toolPlan = normalizeToolPlan(value.tool_plan, quickMode);
+  if (toolPlan) {
+    normalized.tool_plan = toolPlan;
+  }
+
+  const lookaheadOperators = normalizeOperatorList(value.lookahead_operators);
+  if (lookaheadOperators) {
+    normalized.lookahead_operators = lookaheadOperators;
+  }
+
+  const localSearchOperators = normalizeOperatorList(value.local_search_operators);
+  if (localSearchOperators) {
+    normalized.local_search_operators = localSearchOperators;
+  }
+
+  const destroyRepairOperators = normalizeOperatorList(value.destroy_repair_operators);
+  if (destroyRepairOperators) {
+    normalized.destroy_repair_operators = destroyRepairOperators;
+  }
+
+  if (!quickMode) {
+    if (typeof value.enable_vehicle_reduction === 'boolean') {
+      normalized.enable_vehicle_reduction = value.enable_vehicle_reduction;
+    }
+    if (typeof value.enable_lookahead === 'boolean') {
+      normalized.enable_lookahead = value.enable_lookahead;
+    }
+    if (typeof value.enable_destroy_repair === 'boolean') {
+      normalized.enable_destroy_repair = value.enable_destroy_repair;
+    }
+    if (typeof value.enable_local_search === 'boolean') {
+      normalized.enable_local_search = value.enable_local_search;
+    }
+  }
+
+  const integerFields = [
+    ['drl_samples', 1, 2048],
+    ['seed_trials', 1, 32],
+    ['initial_candidate_count', 1, 128],
+    ['lookahead_depth', 1, 8],
+    ['lookahead_beam_width', 1, 64],
+    ['lookahead_per_operator_limit', 1, 64],
+    ['local_search_rounds', 1, 1000],
+    ['destroy_repair_rounds', 1, 1000],
+    ['vehicle_reduction_rounds', 1, 1000],
+  ];
+
+  for (const [field, min, max] of integerFields) {
+    if (value[field] !== undefined && value[field] !== null && value[field] !== '') {
+      normalized[field] = clampInt(value[field], min, max, min);
+    }
+  }
+
+  return normalized;
+}
+
+function withSolveDefaults(payload, mode, settings, solverConfig = null) {
   const quickMode = mode === 'quick';
+  const normalizedSolverConfig = normalizeSolverConfig(solverConfig, quickMode);
+  const rawConfig = {
+    ...(payload.config && typeof payload.config === 'object' ? payload.config : {}),
+    ...normalizedSolverConfig,
+  };
   const defaultSeedTrials = quickMode ? 8 : 1;
 
   return {
@@ -324,6 +496,24 @@ function withSolveDefaults(payload, mode, settings) {
       lookahead_k: clampInt(rawConfig.lookahead_k, 1, 64, 1),
       enable_local_search: quickMode ? false : rawConfig.enable_local_search ?? settings.enableLocalSearch,
       local_search_rounds: clampInt(rawConfig.local_search_rounds, 1, 1000, settings.localSearchRounds),
+      ...(rawConfig.tool_plan ? { tool_plan: rawConfig.tool_plan } : {}),
+      ...(rawConfig.lookahead_operators ? { lookahead_operators: rawConfig.lookahead_operators } : {}),
+      ...(rawConfig.local_search_operators ? { local_search_operators: rawConfig.local_search_operators } : {}),
+      ...(rawConfig.destroy_repair_operators ? { destroy_repair_operators: rawConfig.destroy_repair_operators } : {}),
+      ...(rawConfig.enable_vehicle_reduction !== undefined ? { enable_vehicle_reduction: Boolean(rawConfig.enable_vehicle_reduction) } : {}),
+      ...(rawConfig.enable_destroy_repair !== undefined ? { enable_destroy_repair: Boolean(rawConfig.enable_destroy_repair) } : {}),
+      ...(rawConfig.initial_candidate_count !== undefined
+        ? { initial_candidate_count: clampInt(rawConfig.initial_candidate_count, 1, 128, 1) }
+        : {}),
+      ...(rawConfig.lookahead_per_operator_limit !== undefined
+        ? { lookahead_per_operator_limit: clampInt(rawConfig.lookahead_per_operator_limit, 1, 64, settings.lookaheadBeamWidth) }
+        : {}),
+      ...(rawConfig.destroy_repair_rounds !== undefined
+        ? { destroy_repair_rounds: clampInt(rawConfig.destroy_repair_rounds, 1, 1000, settings.localSearchRounds) }
+        : {}),
+      ...(rawConfig.vehicle_reduction_rounds !== undefined
+        ? { vehicle_reduction_rounds: clampInt(rawConfig.vehicle_reduction_rounds, 1, 1000, 10) }
+        : {}),
     },
   };
 }
@@ -541,7 +731,7 @@ function getBatchParallelism(mode, instanceCount) {
   return Math.max(1, Math.min(instanceCount, maxParallelism));
 }
 
-async function runBatchSolversWithProgress(sender, requestId, batchEntries, mode, settings, structuredText) {
+async function runBatchSolversWithProgress(sender, requestId, batchEntries, mode, settings, structuredText, solverConfig = null) {
   const parallelism = getBatchParallelism(mode, batchEntries.length);
   const batchItems = new Array(batchEntries.length);
   let cursor = 0;
@@ -558,7 +748,7 @@ async function runBatchSolversWithProgress(sender, requestId, batchEntries, mode
       }
 
       const entry = batchEntries[index];
-      const normalizedPayload = withSolveDefaults(entry.ingestResult.payload, mode, settings);
+      const normalizedPayload = withSolveDefaults(entry.ingestResult.payload, mode, settings, solverConfig);
       emitProgress(sender, requestId, 'solve', '批量并行求解', 'running', `开始 ${index + 1}/${batchEntries.length} · ${entry.fileName}`);
 
       try {
@@ -617,6 +807,71 @@ function buildAgentUserPrompt(text, conversation, ingestResult) {
   context.push('Current User Message:');
   context.push(text || '(empty)');
   return context.join('\n');
+}
+
+function summarizePayloadForStrategy(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return null;
+  }
+
+  const instance = payload.instance && typeof payload.instance === 'object' ? payload.instance : {};
+  const nodeCount = Array.isArray(instance.points)
+    ? instance.points.length
+    : Array.isArray(instance.node_xy)
+      ? instance.node_xy.length
+      : null;
+
+  return {
+    problem_type: payload.problem_type ?? null,
+    node_count: nodeCount,
+    capacity: typeof instance.capacity === 'number' ? instance.capacity : null,
+    has_time_windows: Array.isArray(instance.node_tw),
+    service_time_kind: Array.isArray(instance.service_time)
+      ? 'vector'
+      : typeof instance.service_time === 'number'
+        ? 'scalar'
+        : null,
+  };
+}
+
+async function requestSolverStrategy(text, settings, mode, payload, ingestResults) {
+  if (!settings.openaiApiKey || mode !== 'thinking') {
+    return {};
+  }
+
+  try {
+    const parsedResponse = await postOpenAIChat(settings, {
+      model: settings.openaiModel,
+      temperature: 0.1,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: solverStrategyPrompt },
+        {
+          role: 'user',
+          content: [
+            `User request: ${text || '(empty)'}`,
+            `Mode: ${mode}`,
+            `Payload summary: ${JSON.stringify(summarizePayloadForStrategy(payload))}`,
+            Array.isArray(ingestResults) && ingestResults.length > 0
+              ? `Uploaded summaries: ${JSON.stringify(ingestResults.map((item) => item.summary).filter(Boolean))}`
+              : null,
+          ]
+            .filter(Boolean)
+            .join('\n'),
+        },
+      ],
+    });
+
+    const structuredText = extractStructuredText(getMessageText(parsedResponse?.choices?.[0]));
+    if (!structuredText) {
+      return {};
+    }
+
+    const parsed = parseJsonObject(structuredText);
+    return normalizeSolverConfig(parsed.solver_config ?? parsed, false);
+  } catch {
+    return {};
+  }
 }
 
 function hasExplicitSolveIntent(text) {
@@ -854,8 +1109,23 @@ async function solveRequest(event, request) {
     throw new Error('模型决定调用求解器，但没有返回有效 payload。');
   }
 
+  const quickMode = mode === 'quick';
+  const modelSolverConfig = normalizeSolverConfig(decision.solver_config, quickMode);
+  const solverConfig =
+    Object.keys(modelSolverConfig).length > 0
+      ? modelSolverConfig
+      : await requestSolverStrategy(text, settings, mode, payload ?? batchEntries?.[0]?.ingestResult?.payload ?? null, ingestResults);
+
   if (batchEntries) {
-    const { batchItems } = await runBatchSolversWithProgress(sender, requestId, batchEntries, mode, settings, structuredText);
+    const { batchItems } = await runBatchSolversWithProgress(
+      sender,
+      requestId,
+      batchEntries,
+      mode,
+      settings,
+      structuredText,
+      solverConfig,
+    );
     if (conversation.length === 0) {
       suggestedTitle = await requestConversationTitle(settings, {
         text,
@@ -879,72 +1149,13 @@ async function solveRequest(event, request) {
         durationMs: Date.now() - startedAt,
         structuredText,
         ingestResult: firstBatchItem.ingestResult,
-        runtimeDefaults: {
-          gpuBudgetMb: GPU_BUDGET_MB,
-          fastSingleInstanceVramMb: FAST_SINGLE_INSTANCE_VRAM_MB,
-          thinkingSingleInstanceVramMb: THINKING_SINGLE_INSTANCE_VRAM_MB,
-          fastMaxParallelInstances: FAST_DEFAULT_INSTANCE_PARALLELISM,
-          thinkingMaxParallelInstances: THINKING_DEFAULT_INSTANCE_PARALLELISM,
-        },
-        batchItems,
-      },
-    };
-    emitProgress(sender, requestId, 'solve', '调用批量求解链', 'running', `${batchEntries.length} 个实例`);
-
-    for (let index = 0; index < batchEntries.length; index += 1) {
-      const entry = batchEntries[index];
-      const normalizedPayload = withSolveDefaults(entry.ingestResult.payload, mode, settings);
-      emitProgress(sender, requestId, 'solve', `批量求解 ${index + 1}/${batchEntries.length}`, 'running', entry.fileName);
-      const solveExecution = await runSolverWithProgress(sender, requestId, normalizedPayload);
-      batchItems.push({
-        fileName: entry.fileName,
-        payload: normalizedPayload,
-        payloadSource: 'upload',
-        result: solveExecution.result,
-        durationMs: solveExecution.durationMs,
-        structuredText,
-        ingestResult: entry.ingestResult,
-      });
-    }
-
-    emitProgress(sender, requestId, 'solve', '批量求解完成', 'completed', `${batchItems.length} 个实例`);
-
-    if (conversation.length === 0) {
-      suggestedTitle = await requestConversationTitle(settings, {
-        text,
-        uploadedFiles,
-        ingestResults,
-        replyMessage: null,
-        payload: batchItems[0]?.payload ?? null,
-        solveResult: batchItems[0]?.result ?? null,
-      });
-    }
-
-    const firstItem = batchItems[0];
-    return {
-      kind: 'solve',
-      durationMs: Date.now() - startedAt,
-      suggestedTitle,
-      solveResponse: {
-        payload: firstItem.payload,
-        payloadSource: firstItem.payloadSource,
-        result: firstItem.result,
-        durationMs: Date.now() - startedAt,
-        structuredText,
-        ingestResult: firstItem.ingestResult,
-        runtimeDefaults: {
-          gpuBudgetMb: GPU_BUDGET_MB,
-          fastSingleInstanceVramMb: FAST_SINGLE_INSTANCE_VRAM_MB,
-          thinkingSingleInstanceVramMb: THINKING_SINGLE_INSTANCE_VRAM_MB,
-          fastMaxParallelInstances: FAST_DEFAULT_INSTANCE_PARALLELISM,
-          thinkingMaxParallelInstances: THINKING_DEFAULT_INSTANCE_PARALLELISM,
-        },
+        runtimeDefaults: buildRuntimeDefaultsPayload(),
         batchItems,
       },
     };
   }
 
-  const normalizedPayload = withSolveDefaults(payload, mode, settings);
+  const normalizedPayload = withSolveDefaults(payload, mode, settings, solverConfig);
   emitProgress(sender, requestId, 'solve', '调用本地求解链', 'running', normalizedPayload.problem_type);
   const solveResult = await runSolverWithProgress(sender, requestId, normalizedPayload);
   emitProgress(sender, requestId, 'solve', '本地求解链完成', 'completed', normalizedPayload.problem_type);
@@ -971,13 +1182,7 @@ async function solveRequest(event, request) {
       durationMs: solveResult.durationMs,
       structuredText,
       ingestResult: ingestResults[0] ?? null,
-      runtimeDefaults: {
-        gpuBudgetMb: GPU_BUDGET_MB,
-        fastSingleInstanceVramMb: FAST_SINGLE_INSTANCE_VRAM_MB,
-        thinkingSingleInstanceVramMb: THINKING_SINGLE_INSTANCE_VRAM_MB,
-        fastMaxParallelInstances: FAST_DEFAULT_INSTANCE_PARALLELISM,
-        thinkingMaxParallelInstances: THINKING_DEFAULT_INSTANCE_PARALLELISM,
-      },
+      runtimeDefaults: buildRuntimeDefaultsPayload(),
       batchItems: null,
     },
   };
@@ -992,7 +1197,7 @@ function createWindow() {
     show: false,
     autoHideMenuBar: true,
     backgroundColor: '#ffffff',
-    title: 'OptiChat',
+    title: 'VRP Agent',
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,

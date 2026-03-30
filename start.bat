@@ -83,7 +83,7 @@ echo [OK] dependencies are ready.
 exit /b 0
 
 :help
-echo OptiChat desktop launcher
+echo VRP Agent desktop launcher
 echo.
 echo Usage:
 echo   start.bat         ^(install check + build + electron start^)

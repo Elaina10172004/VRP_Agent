@@ -5,8 +5,8 @@ Local improvement scripts for the DRL seed solutions in [`solver_core`](../solve
 Current operators:
 
 - `TSP`: `two_opt`, `relocate`, `swap`
-- `CVRP`: intra-route `two_opt`, inter/intra-route `relocate`, inter-route `swap`
-- `CVRPTW`: feasible intra-route `two_opt`, feasible inter/intra-route `relocate`, feasible inter-route `swap`
+- `CVRP`: `two_opt`, `relocate`, `swap`, `or_opt`, `two_opt_star`, `cross_exchange`, `route_elimination`
+- `CVRPTW`: `two_opt`, `relocate`, `swap`, `or_opt`, `two_opt_star`, `cross_exchange`, `route_elimination`
 
 ## CLI
 
@@ -32,7 +32,7 @@ If `--input` is omitted, the script reads JSON from `stdin`.
   },
   "config": {
     "max_rounds": 50,
-    "operators": ["two_opt", "relocate", "swap"]
+    "operators": ["or_opt", "two_opt_star", "cross_exchange", "relocate", "swap", "two_opt"]
   }
 }
 ```

@@ -12,5 +12,6 @@ optichat/build/
 optichat/coverage/
 
 *.log
+~$*.xlsx
 .DS_Store
 Thumbs.db

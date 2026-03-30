@@ -1,0 +1,5 @@
+{
+  "gpu_budget_mb": 6144,
+  "fast_single_instance_vram_mb": 91,
+  "thinking_single_instance_vram_mb": 123
+}

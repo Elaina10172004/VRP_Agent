@@ -1,13 +1,18 @@
 # solver_skill
 
-Unified solve pipeline for OptiChat:
+Solve orchestration layer for the VRP agent.
 
-1. `DRL` seed generation from `solver_core`
-2. optional `lookahead`
-3. optional `local_search`
+Available actions:
 
-Default DRL behavior is `k=128` rollouts and selecting the best rollout.
-In `hybrid` mode, the default chain is `DRL -> lookahead -> local_search` unless a stage is explicitly disabled.
+- `construct_initial`
+- `validate_solution`
+- `reduce_vehicles`
+- `apply_lookahead`
+- `destroy_repair`
+- `improve_solution`
+- `compare_solutions`
+
+Default DRL behavior is still `k=128` rollouts and selecting the best rollout, but the post-processing chain is now configurable through `tool_plan` and operator lists instead of being hardcoded.
 
 ## CLI
 
@@ -29,13 +34,25 @@ python -m solver_skill.cli --input payload.json --output result.json --pretty
   "config": {
     "mode": "hybrid",
     "drl_samples": 128,
+    "tool_plan": [
+      "construct_initial",
+      "validate_solution",
+      "reduce_vehicles",
+      "validate_solution",
+      "apply_lookahead",
+      "validate_solution",
+      "improve_solution",
+      "compare_solutions"
+    ],
+    "enable_vehicle_reduction": true,
     "enable_lookahead": true,
     "lookahead_depth": 2,
     "lookahead_beam_width": 4,
     "enable_local_search": true,
-    "local_search_rounds": 50
+    "local_search_rounds": 50,
+    "local_search_operators": ["or_opt", "two_opt_star", "cross_exchange", "relocate", "swap", "two_opt"]
   }
 }
 ```
 
-`mode="fast"` will skip lookahead and local search and return the DRL seed directly.
+`mode="fast"` keeps the short path and returns the best DRL construction result directly.
