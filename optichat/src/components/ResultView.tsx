@@ -157,7 +157,7 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
                 </div>
               </div>
 
-              <div className="mt-5 grid gap-4 sm:grid-cols-2">
+              <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
                 <div>
                   <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">{isBatch ? '批量规模' : '问题类型'}</div>
                   <div className="mt-1 text-base font-semibold text-neutral-900">
@@ -178,6 +178,24 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
                     {((isBatch ? solveResponse.durationMs : activeSolveResponse.durationMs) / 1000).toFixed(2)} 秒
                   </div>
                 </div>
+                {ingestSummary && (
+                  <div>
+                    <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">识别格式</div>
+                    <div className="mt-1 text-base font-semibold text-neutral-900">{ingestSummary.detected_format}</div>
+                  </div>
+                )}
+                {ingestSummary && (
+                  <div>
+                    <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">节点数量</div>
+                    <div className="mt-1 text-base font-semibold text-neutral-900">{ingestSummary.node_count}</div>
+                  </div>
+                )}
+                {ingestSummary?.capacity !== undefined && (
+                  <div>
+                    <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">容量</div>
+                    <div className="mt-1 text-base font-semibold text-neutral-900">{ingestSummary.capacity}</div>
+                  </div>
+                )}
               </div>
 
               <div className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
@@ -187,22 +205,6 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
                 </div>
               </div>
             </div>
-
-            {ingestSummary && (
-              <div className="rounded-3xl border border-neutral-200 bg-white p-5 shadow-sm">
-                <div className="text-sm font-semibold text-neutral-900">上传实例摘要</div>
-                <div className="mt-3 grid gap-3 text-sm text-neutral-600">
-                  <div>识别格式：{ingestSummary.detected_format}</div>
-                  <div>节点数量：{ingestSummary.node_count}</div>
-                  {ingestSummary.capacity !== undefined && <div>容量：{ingestSummary.capacity}</div>}
-                </div>
-                <div className="mt-3 rounded-2xl bg-neutral-50 px-4 py-3 text-xs leading-6 text-neutral-500 break-all">
-                  保存目录：{activeSolveResponse.ingestResult?.saved_directory}
-                  <br />
-                  标准化文件：{activeSolveResponse.ingestResult?.canonical_path}
-                </div>
-              </div>
-            )}
 
             <div className="rounded-3xl border border-neutral-200 bg-white p-5 shadow-sm">
               <div className="text-sm font-semibold text-neutral-900">求解过程</div>
@@ -236,9 +238,9 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
 
       <div className="rounded-3xl border border-neutral-200 bg-white p-5 shadow-sm">
         <div className="text-sm font-semibold text-neutral-900">路线明细</div>
-        <div className="mt-1 text-xs text-neutral-500">从左到右横向浏览全部路线，悬停时会同步高亮地图中的对应路线。</div>
+        <div className="mt-1 text-xs text-neutral-500">每行显示三条路线，悬停时会同步高亮地图中的对应路线。</div>
 
-        <div className="mt-4 flex gap-3 overflow-x-auto pb-1">
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {view.routes.map((route, index) => {
             const isActive = highlightedRouteId === route.id;
             const isDimmed = highlightedRouteId !== null && highlightedRouteId !== route.id;
@@ -248,7 +250,7 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
                 key={route.id}
                 onMouseEnter={() => setHighlightedRouteId(route.id)}
                 onMouseLeave={() => setHighlightedRouteId(null)}
-                className={`min-w-[320px] max-w-[420px] flex-none rounded-2xl border px-4 py-3 text-left text-sm leading-6 transition-colors ${
+                className={`w-full rounded-2xl border px-4 py-3 text-left text-sm leading-6 transition-colors ${
                   isActive
                     ? 'border-neutral-900 bg-neutral-900 text-white'
                     : isDimmed

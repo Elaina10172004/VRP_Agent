@@ -41,6 +41,8 @@ function formatNumber(value: number): string {
 }
 
 export function MapVisualization({ solveResponse, highlightedRouteId, onHighlightRoute }: MapVisualizationProps) {
+  const xPadding = 72;
+  const yPadding = 132;
   const view = useMemo(() => buildSolveViewModel(solveResponse), [solveResponse]);
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
 
@@ -132,10 +134,10 @@ export function MapVisualization({ solveResponse, highlightedRouteId, onHighligh
                 return null;
               }
 
-              const x1 = project(fromNode.x, bounds.minX, bounds.maxX, 1000, 72);
-              const y1 = project(fromNode.y, bounds.minY, bounds.maxY, 720, 72);
-              const x2 = project(toNode.x, bounds.minX, bounds.maxX, 1000, 72);
-              const y2 = project(toNode.y, bounds.minY, bounds.maxY, 720, 72);
+              const x1 = project(fromNode.x, bounds.minX, bounds.maxX, 1000, xPadding);
+              const y1 = project(fromNode.y, bounds.minY, bounds.maxY, 720, yPadding);
+              const x2 = project(toNode.x, bounds.minX, bounds.maxX, 1000, xPadding);
+              const y2 = project(toNode.y, bounds.minY, bounds.maxY, 720, yPadding);
               const isDimmed = highlightedRouteId !== null && highlightedRouteId !== route.id;
               const isHighlighted = highlightedRouteId === route.id;
 
@@ -158,8 +160,8 @@ export function MapVisualization({ solveResponse, highlightedRouteId, onHighligh
           )}
 
           {view.nodes.map((node) => {
-            const x = project(node.x, bounds.minX, bounds.maxX, 1000, 72);
-            const y = project(node.y, bounds.minY, bounds.maxY, 720, 72);
+            const x = project(node.x, bounds.minX, bounds.maxX, 1000, xPadding);
+            const y = project(node.y, bounds.minY, bounds.maxY, 720, yPadding);
             const routeColor = node.isDepot ? '#dc2626' : nodeColorLookup.get(node.id) ?? '#404040';
             const isHovered = hoveredNodeId === node.id;
             const isDimmed = highlightedRouteId !== null && !highlightedNodeIds.has(node.id);
