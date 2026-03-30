@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .common import EPS, build_distance_matrix, ensure_points
+from .common import EPS, build_distance_matrix, ensure_points, is_better_score, normalize_objective_spec, score_tsp_tour
 
 
 def tour_length(tour: list[int], distance_matrix: list[list[float]]) -> float:
@@ -99,15 +99,17 @@ def improve_tsp_solution(
         raise ValueError("TSP solution tour length does not match instance size.")
 
     distance_matrix = build_distance_matrix(points)
+    objective = normalize_objective_spec(config.get("objective"))
     operators = config.get("operators", ["two_opt", "relocate", "swap"])
     max_rounds = int(config.get("max_rounds", 50))
 
     current = list(tour)
-    initial_distance = tour_length(current, distance_matrix)
+    initial_score = score_tsp_tour(current, distance_matrix, objective)
     applied_operators: list[str] = []
 
     for _ in range(max_rounds):
         improved = False
+        current_score = score_tsp_tour(current, distance_matrix, objective)
         for operator in operators:
             if operator == "two_opt":
                 move = best_two_opt_move(current, distance_matrix)
@@ -121,7 +123,12 @@ def improve_tsp_solution(
             if move is None:
                 continue
 
-            current, _ = move
+            candidate, _ = move
+            candidate_score = score_tsp_tour(candidate, distance_matrix, objective)
+            if not is_better_score(candidate_score, current_score):
+                continue
+
+            current = candidate
             applied_operators.append(operator)
             improved = True
             break
@@ -129,17 +136,20 @@ def improve_tsp_solution(
         if not improved:
             break
 
-    final_distance = tour_length(current, distance_matrix)
+    final_score = score_tsp_tour(current, distance_matrix, objective)
     return {
         "problem_type": "tsp",
         "tour": current,
         "closed_tour": current + [current[0]] if current else [],
-        "distance": final_distance,
+        "distance": final_score.distance,
         "meta": {
-            "initial_distance": initial_distance,
-            "improved_distance": final_distance,
-            "improvement": initial_distance - final_distance,
+            "initial_distance": initial_score.distance,
+            "improved_distance": final_score.distance,
+            "initial_score": initial_score.generalized_cost,
+            "improved_score": final_score.generalized_cost,
+            "improvement": initial_score.generalized_cost - final_score.generalized_cost,
             "iterations": len(applied_operators),
             "applied_operators": applied_operators,
+            "objective": objective.__dict__,
         },
     }

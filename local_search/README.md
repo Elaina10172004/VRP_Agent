@@ -39,6 +39,19 @@ If `--input` is omitted, the script reads JSON from `stdin`.
 
 `solution` can also carry `raw_sequence` for `CVRP/CVRPTW`.
 
+`config` may also include:
+
+```json
+{
+  "objective": {
+    "primary": "vehicle_count",
+    "vehicle_fixed_cost": 100.0
+  }
+}
+```
+
+When `objective` is provided, neighborhood selection is no longer based on pure distance delta. The search compares candidates with a unified objective-aware score.
+
 ## Notes
 
 - Customer indices in `routes` are zero-based.

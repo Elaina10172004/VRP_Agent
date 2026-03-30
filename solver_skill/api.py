@@ -3,6 +3,20 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from local_search import improve_cvrp_solution, improve_cvrptw_solution, improve_tsp_solution
+from local_search.common import (
+    ObjectiveScore,
+    build_distance_matrix,
+    build_vrp_distance_matrix,
+    ensure_points,
+    normalize_demands,
+    normalize_objective_spec,
+    normalize_routes_payload,
+    normalize_service_times,
+    normalize_time_windows,
+    score_cvrp_routes,
+    score_cvrptw_routes,
+    score_tsp_tour,
+)
 from local_search.cvrp import reduce_cvrp_vehicle_count
 from local_search.cvrptw import reduce_cvrptw_vehicle_count
 from solver_core import CVRPSolver, CVRPTWSolver, TSPSolver
@@ -39,17 +53,24 @@ def _repeat_value(value, count: int):
     return [value for _ in range(count)]
 
 
-def _sort_candidates(candidates: list[dict]) -> list[dict]:
-    return sorted(candidates, key=lambda item: float(item["distance"]))
-
-
 def _candidate_distances(candidates: list[dict] | None) -> list[float] | None:
     if candidates is None:
         return None
     return [float(item["distance"]) for item in candidates]
 
 
-def _report_progress(progress: Callable[[str, str, str | None], None] | None, step_id: str, label: str, detail: str | None = None):
+def _candidate_scores(scored_items: list[dict] | None) -> list[float] | None:
+    if scored_items is None:
+        return None
+    return [float(item["score"].generalized_cost) for item in scored_items]
+
+
+def _report_progress(
+    progress: Callable[[str, str, str | None], None] | None,
+    step_id: str,
+    label: str,
+    detail: str | None = None,
+):
     if progress is not None:
         progress(step_id, label, detail)
 
@@ -120,32 +141,123 @@ def _build_seed_candidates(
     raise ValueError(f"Unsupported problem_type: {problem_type}")
 
 
+def _validation_to_score(validation: dict, objective: dict) -> ObjectiveScore:
+    objective_spec = normalize_objective_spec(objective)
+    feasible = bool(validation["feasible"])
+    vehicle_count = int(validation["vehicle_count"])
+    distance = float(validation["distance"])
+    generalized_cost = (
+        objective_spec.vehicle_fixed_cost * vehicle_count
+        + objective_spec.distance_weight * distance
+        + objective_spec.duration_weight * distance
+    )
+    if not feasible:
+        generalized_cost = float("inf")
+    return ObjectiveScore(
+        feasible=feasible,
+        vehicle_count=vehicle_count,
+        distance=distance,
+        duration=distance,
+        generalized_cost=generalized_cost,
+        violations=len(validation.get("violations", [])),
+        objective=objective_spec,
+    )
+
+
+def _score_solution(problem_type: str, instance: dict, solution: dict, objective: dict) -> ObjectiveScore:
+    objective_spec = normalize_objective_spec(objective)
+
+    if problem_type == "tsp":
+        points = ensure_points(instance["points"])
+        distance_matrix = build_distance_matrix(points)
+        if isinstance(solution.get("tour"), list):
+            tour = [int(node) for node in solution["tour"]]
+        elif isinstance(solution.get("closed_tour"), list):
+            closed_tour = [int(node) for node in solution["closed_tour"]]
+            tour = closed_tour[:-1] if len(closed_tour) >= 2 and closed_tour[0] == closed_tour[-1] else closed_tour
+        else:
+            raise ValueError("TSP solution must contain 'tour' or 'closed_tour'.")
+        return score_tsp_tour(tour, distance_matrix, objective_spec)
+
+    if problem_type == "cvrp":
+        distance_matrix = build_vrp_distance_matrix(instance["depot_xy"], instance["node_xy"])
+        routes = normalize_routes_payload(solution)
+        return score_cvrp_routes(routes, distance_matrix, objective_spec)
+
+    if problem_type == "cvrptw":
+        distance_matrix = build_vrp_distance_matrix(instance["depot_xy"], instance["node_xy"])
+        routes = normalize_routes_payload(solution)
+        demands = normalize_demands(instance["node_demand"])
+        capacity = float(instance["capacity"])
+        time_windows = normalize_time_windows(instance["node_tw"])
+        service_times = normalize_service_times(instance["service_time"], len(demands))
+        return score_cvrptw_routes(routes, distance_matrix, demands, capacity, time_windows, service_times, objective_spec)
+
+    raise ValueError(f"Unsupported problem_type: {problem_type}")
+
+
+def _score_with_validation(problem_type: str, instance: dict, solution: dict, validation: dict, objective: dict) -> ObjectiveScore:
+    try:
+        score = _score_solution(problem_type, instance, solution, objective)
+    except Exception:
+        return _validation_to_score(validation, objective)
+    if score.feasible != bool(validation["feasible"]):
+        return _validation_to_score(validation, objective)
+    return score
+
+
+def _sort_candidates(problem_type: str, instance: dict, objective: dict, candidates: list[dict]) -> list[dict]:
+    scored_items = []
+    for candidate in candidates:
+        validation = validate_solution(problem_type, instance, candidate)
+        score = _score_with_validation(problem_type, instance, candidate, validation, objective)
+        scored_items.append(
+            {
+                "solution": candidate,
+                "validation": validation,
+                "score": score,
+            }
+        )
+    scored_items.sort(key=lambda item: item["score"].ranking_key())
+    return scored_items
+
+
 def construct_initial(
     problem_type: str,
     instance: dict,
     config: dict,
     progress: Callable[[str, str, str | None], None] | None = None,
 ) -> dict:
+    objective = normalize_objective_spec(config.get("objective"))
     seed_trials = max(1, int(config.get("seed_trials", 1)))
     candidate_count_per_seed = max(1, int(config.get("initial_candidate_count", config.get("lookahead_k", 1))))
 
-    _report_progress(progress, "seed", "构造初始解", f"seed_trials={seed_trials}, topk={candidate_count_per_seed}")
-    candidates = _sort_candidates(
+    _report_progress(progress, "seed", "Construct initial solution", f"seed_trials={seed_trials}, topk={candidate_count_per_seed}")
+    scored_candidates = _sort_candidates(
+        problem_type,
+        instance,
+        objective,
         _build_seed_candidates(
             problem_type,
             instance,
             config,
             trial_count=seed_trials,
             candidate_count=candidate_count_per_seed,
-        )
+        ),
     )
-    best_solution = candidates[0]
-    validation = validate_solution(problem_type, instance, best_solution)
-    _report_progress(progress, "seed_done", "初始解完成", f"best_distance={float(best_solution['distance']):.3f}")
+    best_item = scored_candidates[0]
+    _report_progress(
+        progress,
+        "seed_done",
+        "Initial solution ready",
+        f"score={best_item['score'].generalized_cost:.3f}, distance={best_item['score'].distance:.3f}",
+    )
     return {
-        "candidates": candidates,
-        "best_solution": best_solution,
-        "validation": validation,
+        "candidates": [item["solution"] for item in scored_candidates],
+        "scored_candidates": scored_candidates,
+        "best_solution": best_item["solution"],
+        "validation": best_item["validation"],
+        "best_score": best_item["score"],
         "seed_trials": seed_trials,
         "candidate_count_per_seed": candidate_count_per_seed,
     }
@@ -167,9 +279,15 @@ def apply_lookahead_action(
         "beam_width": int(config.get("lookahead_beam_width", 4)),
         "per_operator_limit": int(config.get("lookahead_per_operator_limit", int(config.get("lookahead_beam_width", 4)))),
         "operators": config.get("lookahead_operators", config.get("operators", DEFAULT_LOOKAHEAD_OPERATORS)),
+        "objective": config.get("objective"),
     }
 
-    _report_progress(progress, "lookahead", "执行 Lookahead", f"depth={lookahead_config['depth']}, beam={lookahead_config['beam_width']}")
+    _report_progress(
+        progress,
+        "lookahead",
+        "Run lookahead",
+        f"depth={lookahead_config['depth']}, beam={lookahead_config['beam_width']}",
+    )
     if problem_type == "tsp":
         improved = apply_tsp_lookahead(instance, solution, lookahead_config)
     elif problem_type == "cvrp":
@@ -179,7 +297,8 @@ def apply_lookahead_action(
     else:
         raise ValueError(f"Unsupported problem_type: {problem_type}")
 
-    _report_progress(progress, "lookahead_done", "Lookahead 完成", f"distance={float(improved['distance']):.3f}")
+    score = _score_solution(problem_type, instance, improved, lookahead_config["objective"])
+    _report_progress(progress, "lookahead_done", "Lookahead finished", f"score={score.generalized_cost:.3f}")
     return improved
 
 
@@ -193,9 +312,10 @@ def improve_solution(
     ls_config = {
         "max_rounds": int(config.get("local_search_rounds", 50)),
         "operators": config.get("local_search_operators", config.get("operators", DEFAULT_IMPROVEMENT_OPERATORS)),
+        "objective": config.get("objective"),
     }
 
-    _report_progress(progress, "local_search", "执行改进搜索", f"rounds={ls_config['max_rounds']}")
+    _report_progress(progress, "local_search", "Run local search", f"rounds={ls_config['max_rounds']}")
     if problem_type == "tsp":
         improved = improve_tsp_solution(instance, solution, ls_config)
     elif problem_type == "cvrp":
@@ -205,7 +325,8 @@ def improve_solution(
     else:
         raise ValueError(f"Unsupported problem_type: {problem_type}")
 
-    _report_progress(progress, "local_search_done", "改进搜索完成", f"distance={float(improved['distance']):.3f}")
+    score = _score_solution(problem_type, instance, improved, ls_config["objective"])
+    _report_progress(progress, "local_search_done", "Local search finished", f"score={score.generalized_cost:.3f}")
     return improved
 
 
@@ -218,13 +339,16 @@ def destroy_repair(
 ) -> dict:
     dr_config = {
         "max_rounds": int(config.get("destroy_repair_rounds", config.get("local_search_rounds", 50))),
-        "operators": config.get(
-            "destroy_repair_operators",
-            DEFAULT_DESTROY_REPAIR_OPERATORS,
-        ),
+        "operators": config.get("destroy_repair_operators", DEFAULT_DESTROY_REPAIR_OPERATORS),
+        "objective": config.get("objective"),
     }
 
-    _report_progress(progress, "lookahead", "执行破坏修复", f"operators={','.join(dr_config['operators'])}")
+    _report_progress(
+        progress,
+        "destroy_repair",
+        "Run destroy-repair",
+        f"operators={','.join(dr_config['operators'])}",
+    )
     if problem_type == "tsp":
         improved = improve_tsp_solution(instance, solution, dr_config)
     elif problem_type == "cvrp":
@@ -233,7 +357,8 @@ def destroy_repair(
         improved = improve_cvrptw_solution(instance, solution, dr_config)
     else:
         raise ValueError(f"Unsupported problem_type: {problem_type}")
-    _report_progress(progress, "lookahead_done", "破坏修复完成", f"distance={float(improved['distance']):.3f}")
+    score = _score_solution(problem_type, instance, improved, dr_config["objective"])
+    _report_progress(progress, "destroy_repair_done", "Destroy-repair finished", f"score={score.generalized_cost:.3f}")
     return improved
 
 
@@ -247,46 +372,49 @@ def reduce_vehicles(
     if problem_type == "tsp":
         return solution
 
-    _report_progress(progress, "lookahead", "执行删路线", f"rounds={int(config.get('vehicle_reduction_rounds', 10))}")
-    reduction_config = {"max_rounds": int(config.get("vehicle_reduction_rounds", 10))}
+    reduction_config = {
+        "max_rounds": int(config.get("vehicle_reduction_rounds", 10)),
+        "objective": config.get("objective"),
+    }
+    _report_progress(progress, "reduce_vehicles", "Run route elimination", f"rounds={reduction_config['max_rounds']}")
     if problem_type == "cvrp":
         reduced = reduce_cvrp_vehicle_count(instance, solution, reduction_config)
     elif problem_type == "cvrptw":
         reduced = reduce_cvrptw_vehicle_count(instance, solution, reduction_config)
     else:
         raise ValueError(f"Unsupported problem_type: {problem_type}")
-    _report_progress(progress, "lookahead_done", "删路线完成", f"vehicles={len(reduced.get('routes', []))}")
+    score = _score_solution(problem_type, instance, reduced, reduction_config["objective"])
+    _report_progress(
+        progress,
+        "reduce_vehicles_done",
+        "Route elimination finished",
+        f"vehicles={len(reduced.get('routes', []))}, score={score.generalized_cost:.3f}",
+    )
     return reduced
 
 
-def compare_solutions(problem_type: str, instance: dict, solutions: list[dict]) -> dict:
+def compare_solutions(problem_type: str, instance: dict, solutions: list[dict], config: dict | None = None) -> dict:
     if not solutions:
         raise ValueError("At least one solution is required.")
 
+    objective = normalize_objective_spec((config or {}).get("objective"))
     comparisons = []
     for solution in solutions:
         validation = validate_solution(problem_type, instance, solution)
+        score = _score_with_validation(problem_type, instance, solution, validation, objective)
         comparisons.append(
             {
                 "solution": solution,
                 "validation": validation,
+                "score": score,
             }
         )
 
-    def ranking_key(item: dict) -> tuple:
-        validation = item["validation"]
-        feasible_rank = 0 if validation["feasible"] else 1
-        return (
-            feasible_rank,
-            int(validation["vehicle_count"]),
-            float(validation["distance"]),
-            len(validation["violations"]),
-        )
-
-    best = min(comparisons, key=ranking_key)
+    best = min(comparisons, key=lambda item: item["score"].ranking_key())
     return {
         "best_solution": best["solution"],
         "best_validation": best["validation"],
+        "best_score": best["score"],
         "comparisons": comparisons,
     }
 
@@ -317,6 +445,8 @@ def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None
 
     fast_mode = str(config.get("mode", "hybrid")).strip().lower() == "fast"
     mode_name = "fast" if fast_mode else "hybrid"
+    objective = normalize_objective_spec(config.get("objective"))
+    config["objective"] = objective.__dict__
     config.setdefault("seed_trials", 8 if fast_mode else 1)
     config.setdefault("enable_lookahead", not fast_mode)
     config.setdefault("enable_local_search", False)
@@ -326,10 +456,20 @@ def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None
 
     construction = construct_initial(problem_type, instance, config, progress=progress)
     seed_candidates = construction["candidates"]
+    scored_seed_candidates = construction["scored_candidates"]
     seed_solution = construction["best_solution"]
     current_solution = seed_solution
     current_validation = construction["validation"]
-    trace.append({"action": "construct_initial", "validation": current_validation})
+    current_score = construction["best_score"]
+    trace.append(
+        {
+            "action": "construct_initial",
+            "validation": current_validation,
+            "score": current_score.generalized_cost,
+            "vehicle_count": current_score.vehicle_count,
+            "distance": current_score.distance,
+        }
+    )
 
     lookahead_solution = None
     local_search_solution = None
@@ -340,42 +480,99 @@ def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None
             continue
         if action == "validate_solution":
             current_validation = validate_solution(problem_type, instance, current_solution)
-            trace.append({"action": action, "validation": current_validation})
+            current_score = _score_with_validation(problem_type, instance, current_solution, current_validation, objective)
+            trace.append(
+                {
+                    "action": action,
+                    "validation": current_validation,
+                    "score": current_score.generalized_cost,
+                    "vehicle_count": current_score.vehicle_count,
+                    "distance": current_score.distance,
+                }
+            )
             continue
         if action == "reduce_vehicles":
             reduced = reduce_vehicles(problem_type, instance, current_solution, config, progress=progress)
-            current_solution = compare_solutions(problem_type, instance, [current_solution, reduced])["best_solution"]
+            compared = compare_solutions(problem_type, instance, [current_solution, reduced], config)
+            current_solution = compared["best_solution"]
+            current_validation = compared["best_validation"]
+            current_score = compared["best_score"]
             comparison_candidates.append(reduced)
-            trace.append({"action": action, "distance": float(current_solution["distance"])})
+            trace.append(
+                {
+                    "action": action,
+                    "score": current_score.generalized_cost,
+                    "vehicle_count": current_score.vehicle_count,
+                    "distance": current_score.distance,
+                }
+            )
             continue
         if action == "apply_lookahead":
             looked_ahead = apply_lookahead_action(problem_type, instance, current_solution, config, progress=progress)
             lookahead_solution = looked_ahead
-            current_solution = compare_solutions(problem_type, instance, [current_solution, looked_ahead])["best_solution"]
+            compared = compare_solutions(problem_type, instance, [current_solution, looked_ahead], config)
+            current_solution = compared["best_solution"]
+            current_validation = compared["best_validation"]
+            current_score = compared["best_score"]
             comparison_candidates.append(looked_ahead)
-            trace.append({"action": action, "distance": float(looked_ahead["distance"])})
+            trace.append(
+                {
+                    "action": action,
+                    "score": current_score.generalized_cost,
+                    "vehicle_count": current_score.vehicle_count,
+                    "distance": current_score.distance,
+                }
+            )
             continue
         if action == "destroy_repair":
             repaired = destroy_repair(problem_type, instance, current_solution, config, progress=progress)
-            current_solution = compare_solutions(problem_type, instance, [current_solution, repaired])["best_solution"]
+            compared = compare_solutions(problem_type, instance, [current_solution, repaired], config)
+            current_solution = compared["best_solution"]
+            current_validation = compared["best_validation"]
+            current_score = compared["best_score"]
             comparison_candidates.append(repaired)
-            trace.append({"action": action, "distance": float(repaired["distance"])})
+            trace.append(
+                {
+                    "action": action,
+                    "score": current_score.generalized_cost,
+                    "vehicle_count": current_score.vehicle_count,
+                    "distance": current_score.distance,
+                }
+            )
             continue
         if action == "improve_solution":
             improved = improve_solution(problem_type, instance, current_solution, config, progress=progress)
             local_search_solution = improved
-            current_solution = compare_solutions(problem_type, instance, [current_solution, improved])["best_solution"]
-            comparison_candidates.append(improved)
-            trace.append({"action": action, "distance": float(improved["distance"])})
-            continue
-        if action == "compare_solutions":
-            compared = compare_solutions(problem_type, instance, comparison_candidates)
+            compared = compare_solutions(problem_type, instance, [current_solution, improved], config)
             current_solution = compared["best_solution"]
             current_validation = compared["best_validation"]
-            trace.append({"action": action, "distance": float(current_solution["distance"])})
+            current_score = compared["best_score"]
+            comparison_candidates.append(improved)
+            trace.append(
+                {
+                    "action": action,
+                    "score": current_score.generalized_cost,
+                    "vehicle_count": current_score.vehicle_count,
+                    "distance": current_score.distance,
+                }
+            )
+            continue
+        if action == "compare_solutions":
+            compared = compare_solutions(problem_type, instance, comparison_candidates, config)
+            current_solution = compared["best_solution"]
+            current_validation = compared["best_validation"]
+            current_score = compared["best_score"]
+            trace.append(
+                {
+                    "action": action,
+                    "score": current_score.generalized_cost,
+                    "vehicle_count": current_score.vehicle_count,
+                    "distance": current_score.distance,
+                }
+            )
             continue
 
-    _report_progress(progress, "finalize", "整理最终结果", f"final_distance={float(current_solution['distance']):.3f}")
+    _report_progress(progress, "finalize", "Finalize solution", f"score={current_score.generalized_cost:.3f}")
 
     return {
         "problem_type": problem_type,
@@ -385,11 +582,13 @@ def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None
         "final_solution": current_solution,
         "meta": {
             "mode": mode_name,
+            "objective": objective.__dict__,
             "drl_samples": int(config.get("drl_samples", 128)),
             "seed_policy": _seed_policy(construction["seed_trials"], construction["candidate_count_per_seed"]),
             "seed_trials": construction["seed_trials"],
             "candidate_count_per_seed": construction["candidate_count_per_seed"],
             "seed_candidate_distances": _candidate_distances(seed_candidates),
+            "seed_candidate_scores": _candidate_scores(scored_seed_candidates),
             "enable_lookahead": bool(config.get("enable_lookahead", False)) and not fast_mode,
             "lookahead_depth": int(config.get("lookahead_depth", 2)),
             "lookahead_beam_width": int(config.get("lookahead_beam_width", 4)),
@@ -408,6 +607,13 @@ def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None
             "tool_plan": tool_plan,
             "tool_trace": trace,
             "final_validation": current_validation,
+            "final_score": {
+                "generalized_cost": current_score.generalized_cost,
+                "vehicle_count": current_score.vehicle_count,
+                "distance": current_score.distance,
+                "duration": current_score.duration,
+                "ranking_key": list(current_score.ranking_key()),
+            },
             "runtime_defaults": build_runtime_defaults_payload(),
         },
     }

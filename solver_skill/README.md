@@ -14,6 +14,8 @@ Available actions:
 
 Default DRL behavior is still `k=128` rollouts and selecting the best rollout, but the post-processing chain is now configurable through `tool_plan` and operator lists instead of being hardcoded.
 
+All ranking now goes through `objective`, so construction selection, lookahead, and local search can optimize for more than pure distance.
+
 ## CLI
 
 ```bash
@@ -45,6 +47,10 @@ python -m solver_skill.cli --input payload.json --output result.json --pretty
       "compare_solutions"
     ],
     "enable_vehicle_reduction": true,
+    "objective": {
+      "primary": "vehicle_count",
+      "vehicle_fixed_cost": 100.0
+    },
     "enable_lookahead": true,
     "lookahead_depth": 2,
     "lookahead_beam_width": 4,
@@ -56,3 +62,13 @@ python -m solver_skill.cli --input payload.json --output result.json --pretty
 ```
 
 `mode="fast"` keeps the short path and returns the best DRL construction result directly.
+
+Supported objective fields:
+
+- `primary`: `distance` or `vehicle_count`
+- `vehicle_fixed_cost`
+- `distance_weight`
+- `duration_weight`
+- `overtime_penalty`
+- `lateness_penalty`
+- `unserved_penalty`

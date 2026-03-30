@@ -82,7 +82,7 @@ const agentDecisionPrompt = [
   '1. {"action":"solve","payload":{...}}',
   '2. {"action":"solve","use_uploaded_payload":true}',
   'You may also attach "solver_config" when returning solve. Example:',
-  '3. {"action":"solve","use_uploaded_payload":true,"solver_config":{"tool_plan":["construct_initial","validate_solution","reduce_vehicles","apply_lookahead","improve_solution","compare_solutions"],"enable_vehicle_reduction":true,"local_search_operators":["or_opt","relocate","swap","two_opt"]}}',
+  '3. {"action":"solve","use_uploaded_payload":true,"solver_config":{"tool_plan":["construct_initial","validate_solution","reduce_vehicles","apply_lookahead","improve_solution","compare_solutions"],"enable_vehicle_reduction":true,"local_search_operators":["or_opt","relocate","swap","two_opt"],"objective":{"primary":"vehicle_count","vehicle_fixed_cost":100.0}}}',
   'If the user is asking a general question, wants explanation, or is chatting, return:',
   '4. {"action":"reply","message":"..."}',
   'Never choose solve unless the intent is clearly to solve or optimize.',
@@ -100,6 +100,7 @@ const solverStrategyPrompt = [
   'Format: {"solver_config":{...}}',
   'Allowed tool_plan steps: construct_initial, validate_solution, reduce_vehicles, apply_lookahead, destroy_repair, improve_solution, compare_solutions.',
   'Allowed operators: two_opt, relocate, swap, or_opt, two_opt_star, cross_exchange, route_elimination.',
+  'You may also set solver_config.objective, for example {"primary":"vehicle_count","vehicle_fixed_cost":100.0,"lateness_penalty":10.0}.',
   'Every plan must start with construct_initial and end with compare_solutions.',
   'Insert validate_solution after each major action.',
   'For TSP never use reduce_vehicles or route_elimination.',
@@ -390,6 +391,42 @@ function normalizeOperatorList(value) {
   return normalized.length > 0 ? normalized : undefined;
 }
 
+function normalizeObjectiveSpec(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const source = value.objective && typeof value.objective === 'object' ? value.objective : value;
+  const normalized = {};
+  const primary = String(source.primary || '').trim().toLowerCase();
+  if (primary === 'distance' || primary === 'vehicle_count') {
+    normalized.primary = primary;
+  }
+  if (typeof source.prioritize_vehicle_count === 'boolean') {
+    normalized.prioritize_vehicle_count = source.prioritize_vehicle_count;
+  }
+
+  const numericFields = [
+    'distance_weight',
+    'duration_weight',
+    'vehicle_fixed_cost',
+    'vehicle_count_weight',
+    'overtime_penalty',
+    'lateness_penalty',
+    'unserved_penalty',
+  ];
+  for (const field of numericFields) {
+    if (source[field] !== undefined && source[field] !== null && source[field] !== '') {
+      const parsed = Number(source[field]);
+      if (Number.isFinite(parsed)) {
+        normalized[field] = parsed;
+      }
+    }
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
 function normalizeToolPlan(value, quickMode) {
   if (quickMode) {
     return ['construct_initial', 'validate_solution', 'compare_solutions'];
@@ -435,6 +472,11 @@ function normalizeSolverConfig(value, quickMode) {
   const destroyRepairOperators = normalizeOperatorList(value.destroy_repair_operators);
   if (destroyRepairOperators) {
     normalized.destroy_repair_operators = destroyRepairOperators;
+  }
+
+  const objective = normalizeObjectiveSpec(value.objective ?? value.objective_spec);
+  if (objective) {
+    normalized.objective = objective;
   }
 
   if (!quickMode) {
@@ -500,6 +542,7 @@ function withSolveDefaults(payload, mode, settings, solverConfig = null) {
       ...(rawConfig.lookahead_operators ? { lookahead_operators: rawConfig.lookahead_operators } : {}),
       ...(rawConfig.local_search_operators ? { local_search_operators: rawConfig.local_search_operators } : {}),
       ...(rawConfig.destroy_repair_operators ? { destroy_repair_operators: rawConfig.destroy_repair_operators } : {}),
+      ...(rawConfig.objective ? { objective: rawConfig.objective } : {}),
       ...(rawConfig.enable_vehicle_reduction !== undefined ? { enable_vehicle_reduction: Boolean(rawConfig.enable_vehicle_reduction) } : {}),
       ...(rawConfig.enable_destroy_repair !== undefined ? { enable_destroy_repair: Boolean(rawConfig.enable_destroy_repair) } : {}),
       ...(rawConfig.initial_candidate_count !== undefined

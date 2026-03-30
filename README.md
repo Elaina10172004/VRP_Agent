@@ -91,6 +91,16 @@ python -m instance_skill.solve_cli --input-file .\solomon_data\C101.txt --mode t
 
 `thinking` mode can use richer plans, including route elimination and stronger local-search neighborhoods.
 
+You can also pass an `objective` block so the LLM-driven post-processing stages rank and improve solutions against a custom target instead of pure distance:
+
+```json
+{
+  "primary": "vehicle_count",
+  "vehicle_fixed_cost": 100.0,
+  "lateness_penalty": 10.0
+}
+```
+
 ## Local-search operators
 
 Currently available:
@@ -118,4 +128,3 @@ python .\benchmarks\gpu_capacity.py --help
 The runtime parallelism defaults used by both Python and Electron are derived from:
 
 - `config/runtime_defaults.json`
-
