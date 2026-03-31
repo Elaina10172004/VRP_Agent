@@ -1,4 +1,4 @@
-import type { DesktopSolveResponse, ProblemType, SolverSolution } from '../types/solver';
+import type { DesktopSolveResponse, ProblemType, SolverPipelineMeta, SolverSolution } from '../types/solver';
 
 type XY = [number, number];
 
@@ -26,6 +26,9 @@ export type SolveViewModel = {
   nodes: MapNode[];
   routes: MapRoute[];
   finalDistance: number;
+  finalVehicleCount: number;
+  finalGeneralizedCost: number | null;
+  objectiveSummary: string;
   seedDistance: number;
   lookaheadDistance: number | null;
   localSearchDistance: number | null;
@@ -70,7 +73,7 @@ function asTimeWindows(value: unknown): Array<[number, number] | null> {
   });
 }
 
-function formatDistance(value: number): string {
+function formatNumber(value: number): string {
   return value.toFixed(3).replace(/\.?0+$/, '');
 }
 
@@ -81,7 +84,7 @@ function getProblemTypeLabel(problemType: ProblemType): string {
   if (problemType === 'cvrp') {
     return 'CVRP 容量约束车辆路径';
   }
-  return 'CVRPTW 带时间窗车辆路径';
+  return 'CVRPTW 时间窗车辆路径';
 }
 
 function getRouteLabel(problemType: ProblemType, index: number): string {
@@ -100,6 +103,48 @@ function getPayloadSourceLabel(response: DesktopSolveResponse): string {
     return '直接输入 JSON';
   }
   return '模型结构化';
+}
+
+function buildObjectiveSummary(meta: SolverPipelineMeta): string {
+  const objective = meta.objective;
+  if (!objective) {
+    return '距离优先';
+  }
+
+  const segments = [objective.primary === 'vehicle_count' ? '车辆数优先' : '距离优先'];
+  if (objective.prioritize_vehicle_count) {
+    segments.push('先尽量减车');
+  }
+  if (objective.vehicle_count_weight) {
+    segments.push(`车辆数权重 ${formatNumber(objective.vehicle_count_weight)}`);
+  }
+  if (objective.vehicle_fixed_cost) {
+    segments.push(`车辆固定成本 ${formatNumber(objective.vehicle_fixed_cost)}`);
+  }
+  if (objective.distance_weight && objective.distance_weight !== 1) {
+    segments.push(`距离权重 ${formatNumber(objective.distance_weight)}`);
+  }
+  if (objective.duration_weight) {
+    segments.push(`时长权重 ${formatNumber(objective.duration_weight)}`);
+  }
+  if (objective.lateness_penalty) {
+    segments.push(`迟到惩罚 ${formatNumber(objective.lateness_penalty)}`);
+  }
+  if (objective.overtime_penalty) {
+    segments.push(`超时惩罚 ${formatNumber(objective.overtime_penalty)}`);
+  }
+  if (objective.unserved_penalty) {
+    segments.push(`漏服务惩罚 ${formatNumber(objective.unserved_penalty)}`);
+  }
+  return segments.join(' · ');
+}
+
+function findRouteAnalysis(meta: SolverPipelineMeta, routeIndex: number): Record<string, unknown> | null {
+  const routes = meta.final_analysis?.routes;
+  if (!Array.isArray(routes)) {
+    return null;
+  }
+  return (routes[routeIndex] as Record<string, unknown> | undefined) ?? null;
 }
 
 function buildTspView(response: DesktopSolveResponse): Pick<SolveViewModel, 'nodes' | 'routes' | 'routeLines'> {
@@ -178,7 +223,19 @@ function buildVrpView(response: DesktopSolveResponse): Pick<SolveViewModel, 'nod
 
   const routeLines = rawRoutes.map((route, index) => {
     const body = route.map((node) => `客户 ${node + 1}`).join(' -> ');
-    return body ? `${getRouteLabel(response.result.problem_type, index)}：仓库 -> ${body} -> 仓库` : `${getRouteLabel(response.result.problem_type, index)}：仓库 -> 仓库`;
+    const analysis = findRouteAnalysis(response.result.meta, index);
+    const metrics = [
+      analysis?.distance !== undefined ? `距离 ${formatNumber(asNumber(analysis.distance))}` : null,
+      analysis?.duration !== undefined ? `时长 ${formatNumber(asNumber(analysis.duration))}` : null,
+      analysis?.load !== undefined ? `载重 ${formatNumber(asNumber(analysis.load))}` : null,
+      analysis?.total_waiting_time !== undefined ? `等待 ${formatNumber(asNumber(analysis.total_waiting_time))}` : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    const suffix = metrics ? ` | ${metrics}` : '';
+    return body
+      ? `${getRouteLabel(response.result.problem_type, index)}：仓库 -> ${body} -> 仓库${suffix}`
+      : `${getRouteLabel(response.result.problem_type, index)}：仓库 -> 仓库${suffix}`;
   });
 
   return { nodes, routes, routeLines };
@@ -191,13 +248,15 @@ export function buildSolveViewModel(response: DesktopSolveResponse): SolveViewMo
   const lookaheadDistance = getSolutionDistance(result.lookahead_solution);
   const localSearchDistance = getSolutionDistance(result.local_search_solution);
   const finalDistance = asNumber(result.final_solution.distance);
+  const finalVehicleCount = asNumber(result.meta.final_score?.vehicle_count, baseView.routes.length);
+  const finalGeneralizedCost = result.meta.final_score ? asNumber(result.meta.final_score.generalized_cost) : null;
   const improvement = seedDistance - finalDistance;
 
   const stageLines = [
-    `DRL 初始解：${formatDistance(seedDistance)}`,
-    ...(lookaheadDistance === null ? [] : [`Lookahead：${formatDistance(lookaheadDistance)}`]),
-    ...(localSearchDistance === null ? [] : [`局部搜索：${formatDistance(localSearchDistance)}`]),
-    `最终解：${formatDistance(finalDistance)}`,
+    `DRL 初始解：距离 ${formatNumber(seedDistance)}${result.meta.seed_candidate_scores?.[0] !== undefined ? ` · 分数 ${formatNumber(asNumber(result.meta.seed_candidate_scores[0]))}` : ''}`,
+    ...(lookaheadDistance === null ? [] : [`Lookahead：距离 ${formatNumber(lookaheadDistance)}`]),
+    ...(localSearchDistance === null ? [] : [`局部搜索：距离 ${formatNumber(localSearchDistance)}`]),
+    `最终解：距离 ${formatNumber(finalDistance)} · 车辆 ${finalVehicleCount}${finalGeneralizedCost === null ? '' : ` · 分数 ${formatNumber(finalGeneralizedCost)}`}`,
   ];
 
   return {
@@ -207,6 +266,9 @@ export function buildSolveViewModel(response: DesktopSolveResponse): SolveViewMo
     nodes: baseView.nodes,
     routes: baseView.routes,
     finalDistance,
+    finalVehicleCount,
+    finalGeneralizedCost,
+    objectiveSummary: buildObjectiveSummary(result.meta),
     seedDistance,
     lookaheadDistance,
     localSearchDistance,

@@ -41,17 +41,19 @@ const FAST_SINGLE_INSTANCE_VRAM_MB = runtimeDefaults.fastSingleInstanceVramMb;
 const THINKING_SINGLE_INSTANCE_VRAM_MB = runtimeDefaults.thinkingSingleInstanceVramMb;
 const FAST_DEFAULT_INSTANCE_PARALLELISM = Math.max(1, Math.floor(GPU_BUDGET_MB / FAST_SINGLE_INSTANCE_VRAM_MB));
 const THINKING_DEFAULT_INSTANCE_PARALLELISM = Math.max(1, Math.floor(GPU_BUDGET_MB / THINKING_SINGLE_INSTANCE_VRAM_MB));
+const DEFAULT_LOOKAHEAD_CHUNK_SIZE = 256;
 
 const defaultSettings = Object.freeze({
   openaiBaseUrl: 'https://api.openai.com/v1',
   openaiApiKey: '',
-  openaiModel: 'gpt-5.4-mini',
+  openaiModel: 'gpt-5.4',
   drlSamples: 128,
   enableLookahead: true,
-  lookaheadDepth: 2,
-  lookaheadBeamWidth: 4,
-  enableLocalSearch: false,
-  localSearchRounds: 50,
+  lookaheadTopK: 3,
+  lookaheadConfidentProb: 0.95,
+  enableLocalSearch: true,
+  fastLocalSearchRounds: 8,
+  thinkingLocalSearchRounds: 50,
 });
 
 const ALLOWED_TOOL_PLAN_STEPS = new Set([
@@ -59,6 +61,7 @@ const ALLOWED_TOOL_PLAN_STEPS = new Set([
   'validate_solution',
   'reduce_vehicles',
   'apply_lookahead',
+  'elite_guided_repair',
   'destroy_repair',
   'improve_solution',
   'compare_solutions',
@@ -72,12 +75,20 @@ const ALLOWED_VRP_OPERATORS = new Set([
   'two_opt_star',
   'cross_exchange',
   'route_elimination',
+  'shaw_regret',
 ]);
+
+const pendingIngestTasks = new Map();
 
 const agentDecisionPrompt = [
   'You are the orchestration agent for a desktop routing assistant.',
   'Decide whether the local solve skill should be called, and optionally attach a solver strategy.',
   'Return JSON only. No markdown, no code fences, no commentary.',
+  'If the user mentions penalties, priorities, or tradeoffs such as minimizing vehicles first, paying fixed cost per vehicle, penalizing lateness, or accepting longer distance for fewer vehicles, extract them into solver_config.objective.',
+  'Examples of objective extraction:',
+  '- "优先少用车，距离长一点也可以" -> {"primary":"vehicle_count"}',
+  '- "每多开一辆车罚 100" -> {"vehicle_fixed_cost":100}',
+  '- "迟到重罚，超时也要罚" -> {"lateness_penalty":..., "overtime_penalty":...}',
   'If the user clearly wants solving, routing, optimization, improvement, DRL construction, lookahead, local search, or wants to solve the uploaded instance, return one of:',
   '1. {"action":"solve","payload":{...}}',
   '2. {"action":"solve","use_uploaded_payload":true}',
@@ -98,8 +109,10 @@ const solverStrategyPrompt = [
   'You choose a local tool plan for a routing solver orchestrator.',
   'Return JSON only. No markdown.',
   'Format: {"solver_config":{...}}',
-  'Allowed tool_plan steps: construct_initial, validate_solution, reduce_vehicles, apply_lookahead, destroy_repair, improve_solution, compare_solutions.',
-  'Allowed operators: two_opt, relocate, swap, or_opt, two_opt_star, cross_exchange, route_elimination.',
+  'Read the user tradeoffs carefully and convert them into solver_config.objective when relevant.',
+  'If the user states penalties in natural language, convert them into explicit numeric or structured objective fields whenever possible.',
+  'Allowed tool_plan steps: construct_initial, validate_solution, reduce_vehicles, apply_lookahead, elite_guided_repair, destroy_repair, improve_solution, compare_solutions.',
+  'Allowed operators: two_opt, relocate, swap, or_opt, two_opt_star, cross_exchange, route_elimination, shaw_regret.',
   'You may also set solver_config.objective, for example {"primary":"vehicle_count","vehicle_fixed_cost":100.0,"lateness_penalty":10.0}.',
   'Every plan must start with construct_initial and end with compare_solutions.',
   'Insert validate_solution after each major action.',
@@ -107,6 +120,28 @@ const solverStrategyPrompt = [
   'For CVRP and CVRPTW you may use reduce_vehicles and route_elimination.',
   'Prefer compact plans. Only enable expensive steps when they are likely to help.',
   'If the user explicitly wants speed, keep the plan short.',
+].join('\n');
+
+const refinementStrategyPrompt = [
+  'You choose a post-lookahead refinement strategy for a routing solver.',
+  'Return JSON only. No markdown.',
+  'Format: {"refinement_strategy":{...}}',
+  'This stage starts from an existing feasible solution after lookahead.',
+  'You may enable elite-guided repair right after lookahead to mine common structure from elite DRL candidates and repair from that consensus start.',
+  'Extract user-stated penalties and priorities into objective when needed, but preserve the current objective unless there is a strong reason to change it.',
+  'Use the supplied analysis to pick operators. For example, long waiting suggests relocate/or_opt/cross_exchange; too many routes suggests route_elimination.',
+  'Pay special attention to hotspots such as longest_edges and worst_connection_points. Large depot-connected anomalies or large excess_over_knn usually suggest relocate, or_opt, cross_exchange, or destroy-repair.',
+  'Allowed operators: two_opt, relocate, swap, or_opt, two_opt_star, cross_exchange, route_elimination, shaw_regret.',
+  'Choose local_search_operators, destroy_repair_operators, local_search_rounds, destroy_repair_rounds, improvement_cycles, enable_destroy_repair, enable_vehicle_reduction, and enable_elite_guided_repair.',
+  'You may also set allow_worse_acceptance, acceptance_budget, acceptance_temperature, acceptance_decay, granular_neighbor_k, regret_k, shaw_remove_count, elite_guided_pool_size, elite_guided_polish_rounds, and elite_guided_candidate_count.',
+  'Do not treat elite-guided repair as only a boolean toggle. When it is enabled, explicitly tune elite_guided_pool_size, elite_guided_polish_rounds, and elite_guided_candidate_count from the hotspot pattern.',
+  'Heuristic guidance: if hotspots are concentrated on a few routes or a few very bad depot-connected points, use a smaller or medium elite_guided_pool_size (8-24) and moderate polish rounds (6-12).',
+  'Heuristic guidance: if hotspots are diffuse across many routes, many long edges compete, or the structure looks globally unstable, use a larger elite_guided_pool_size (24-48), larger elite_guided_candidate_count (64-128), and more polish rounds (12-24).',
+  'If the current solution already looks smooth and hotspot severity is low, keep enable_elite_guided_repair false or use very conservative values.',
+  'elite_guided_candidate_count should usually stay <= drl_samples. elite_guided_pool_size should usually stay <= elite_guided_candidate_count.',
+  'Prefer multiple refinement passes for thinking mode.',
+  'Use route_elimination only for CVRP or CVRPTW.',
+  'If the analysis shows long waiting or route imbalance, pick operators that address it.',
 ].join('\n');
 
 const conversationTitlePrompt = [
@@ -144,26 +179,68 @@ function clampInt(value, min, max, fallback) {
 
 function sanitizeSettings(input) {
   const source = input && typeof input === 'object' ? input : {};
+  const legacyLocalSearchRounds = source.localSearchRounds;
+  const legacyLookaheadTopK = source.lookaheadTopK ?? source.lookaheadDepth;
+  const lookaheadConfidentProb = Number(source.lookaheadConfidentProb);
+  const requestedModel =
+    typeof source.openaiModel === 'string' && source.openaiModel.trim()
+      ? source.openaiModel.trim().slice(0, 256)
+      : defaultSettings.openaiModel;
   return {
     openaiBaseUrl:
       typeof source.openaiBaseUrl === 'string' && source.openaiBaseUrl.trim()
         ? source.openaiBaseUrl.trim()
         : defaultSettings.openaiBaseUrl,
     openaiApiKey: typeof source.openaiApiKey === 'string' ? source.openaiApiKey.trim().slice(0, 4096) : '',
-    openaiModel:
-      typeof source.openaiModel === 'string' && source.openaiModel.trim()
-        ? source.openaiModel.trim().slice(0, 256)
-        : defaultSettings.openaiModel,
+    openaiModel: requestedModel === 'gpt-5.4-mini' ? 'gpt-5.4' : requestedModel,
     drlSamples: clampInt(source.drlSamples, 1, 2048, defaultSettings.drlSamples),
     enableLookahead: typeof source.enableLookahead === 'boolean' ? source.enableLookahead : defaultSettings.enableLookahead,
-    lookaheadDepth: clampInt(source.lookaheadDepth, 1, 8, defaultSettings.lookaheadDepth),
-    lookaheadBeamWidth: clampInt(source.lookaheadBeamWidth, 1, 64, defaultSettings.lookaheadBeamWidth),
+    lookaheadTopK: clampInt(legacyLookaheadTopK, 1, 32, defaultSettings.lookaheadTopK),
+    lookaheadConfidentProb: Number.isFinite(lookaheadConfidentProb)
+      ? Math.max(0.5, Math.min(0.999, lookaheadConfidentProb))
+      : defaultSettings.lookaheadConfidentProb,
     enableLocalSearch: typeof source.enableLocalSearch === 'boolean' ? source.enableLocalSearch : defaultSettings.enableLocalSearch,
-    localSearchRounds: clampInt(source.localSearchRounds, 1, 1000, defaultSettings.localSearchRounds),
+    fastLocalSearchRounds: clampInt(
+      source.fastLocalSearchRounds ?? legacyLocalSearchRounds,
+      1,
+      1000,
+      defaultSettings.fastLocalSearchRounds,
+    ),
+    thinkingLocalSearchRounds: clampInt(
+      source.thinkingLocalSearchRounds ?? legacyLocalSearchRounds,
+      1,
+      1000,
+      defaultSettings.thinkingLocalSearchRounds,
+    ),
   };
 }
 
-function loadSettings() {
+function readStoredApiKey(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return '';
+  }
+
+  if (raw.openaiApiKeySecure && safeStorage && safeStorage.isEncryptionAvailable()) {
+    try {
+      return safeStorage.decryptString(Buffer.from(raw.openaiApiKeySecure, 'base64'));
+    } catch {
+      return '';
+    }
+  }
+
+  return typeof raw.openaiApiKey === 'string' ? raw.openaiApiKey : '';
+}
+
+function buildPublicSettings(settings, storedApiKey) {
+  return {
+    ...settings,
+    openaiApiKey: '',
+    hasStoredOpenaiApiKey: Boolean(storedApiKey),
+    openaiApiKeyLast4: storedApiKey ? storedApiKey.slice(-4) : '',
+  };
+}
+
+function loadSettingsWithSecret() {
   const filePath = resolveSettingsFile();
   if (!fs.existsSync(filePath)) {
     return { ...defaultSettings };
@@ -172,35 +249,49 @@ function loadSettings() {
   try {
     const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     const normalized = sanitizeSettings(raw);
-    if (raw.openaiApiKeySecure && safeStorage && safeStorage.isEncryptionAvailable()) {
-      try {
-        normalized.openaiApiKey = safeStorage.decryptString(Buffer.from(raw.openaiApiKeySecure, 'base64'));
-      } catch {
-        normalized.openaiApiKey = '';
-      }
-    } else if (typeof raw.openaiApiKey === 'string') {
-      normalized.openaiApiKey = raw.openaiApiKey;
-    }
+    normalized.openaiApiKey = readStoredApiKey(raw);
     return normalized;
   } catch {
     return { ...defaultSettings };
   }
 }
 
+function loadSettings() {
+  const settings = loadSettingsWithSecret();
+  return buildPublicSettings(settings, settings.openaiApiKey);
+}
+
 function saveSettings(input) {
   const normalized = sanitizeSettings(input);
+  const existing = loadSettingsWithSecret();
+  const nextApiKey = normalized.openaiApiKey || existing.openaiApiKey || '';
   const filePath = resolveSettingsFile();
-  const persisted = { ...normalized };
+  const persisted = {
+    ...normalized,
+    openaiApiKey: '',
+  };
 
-  if (safeStorage && safeStorage.isEncryptionAvailable() && normalized.openaiApiKey) {
-    const encrypted = safeStorage.encryptString(normalized.openaiApiKey);
+  if (safeStorage && safeStorage.isEncryptionAvailable() && nextApiKey) {
+    const encrypted = safeStorage.encryptString(nextApiKey);
     persisted.openaiApiKeySecure = encrypted.toString('base64');
     delete persisted.openaiApiKey;
+  } else if (nextApiKey) {
+    persisted.openaiApiKey = nextApiKey;
   }
 
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(persisted, null, 2), 'utf8');
-  return normalized;
+  return buildPublicSettings(normalized, nextApiKey);
+}
+
+function resolveEffectiveSettings(input) {
+  const requested = sanitizeSettings(input);
+  const stored = loadSettingsWithSecret();
+  return {
+    ...stored,
+    ...requested,
+    openaiApiKey: requested.openaiApiKey || stored.openaiApiKey || '',
+  };
 }
 
 function isJsonLike(text) {
@@ -243,33 +334,55 @@ function parseJsonPayload(text) {
   return payload;
 }
 
-function resolveChatCompletionsUrl(baseUrl) {
+function resolveResponsesUrl(baseUrl) {
   const trimmed = String(baseUrl || '').trim().replace(/\/+$/, '');
   if (!trimmed) {
-    return 'https://api.openai.com/v1/chat/completions';
+    return 'https://api.openai.com/v1/responses';
   }
-  return trimmed.endsWith('/chat/completions') ? trimmed : `${trimmed}/chat/completions`;
+  if (trimmed.endsWith('/responses')) {
+    return trimmed;
+  }
+  if (trimmed.endsWith('/chat/completions')) {
+    return `${trimmed.slice(0, -'/chat/completions'.length)}/responses`;
+  }
+  return `${trimmed}/responses`;
 }
 
-function getMessageText(choice) {
-  const content = choice?.message?.content;
-  if (typeof content === 'string') {
-    return content;
+function buildReasoningConfig(settings) {
+  const model = String(settings?.openaiModel || '')
+    .trim()
+    .toLowerCase();
+  if (!model.startsWith('gpt-5')) {
+    return null;
   }
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === 'string') {
-          return part;
-        }
-        if (part && typeof part.text === 'string') {
-          return part.text;
-        }
-        return '';
-      })
-      .join('');
+  return { effort: 'xhigh' };
+}
+
+function buildOpenAIRequestBody(settings, body) {
+  const reasoning = buildReasoningConfig(settings);
+  return reasoning ? { ...body, reasoning } : body;
+}
+
+function getResponseText(responsePayload) {
+  if (typeof responsePayload?.output_text === 'string' && responsePayload.output_text.trim()) {
+    return responsePayload.output_text.trim();
   }
-  return '';
+
+  if (!Array.isArray(responsePayload?.output)) {
+    return '';
+  }
+
+  return responsePayload.output
+    .flatMap((item) => (Array.isArray(item?.content) ? item.content : []))
+    .map((part) => (part && typeof part.text === 'string' ? part.text : ''))
+    .join('')
+    .trim();
+}
+
+function redactSecrets(value) {
+  return String(value || '')
+    .replace(/sk-[A-Za-z0-9_*.-]+/g, 'sk-[redacted]')
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]');
 }
 
 function sanitizeSuggestedTitle(title, fallback = '新对话') {
@@ -307,7 +420,7 @@ function buildFallbackConversationTitle({ text, uploadedFiles, ingestResults, pa
 }
 
 function buildHtmlResponseError(url, contentType, responseText) {
-  const snippet = String(responseText || '').replace(/\s+/g, ' ').slice(0, 160);
+  const snippet = redactSecrets(String(responseText || '').replace(/\s+/g, ' ').slice(0, 160));
   return new Error(
     `OpenAI 接口返回了 HTML 页面，而不是 JSON。通常是 Base URL 配错了，或代理/登录页拦截了请求。\n请求地址：${url}\nContent-Type：${
       contentType || 'unknown'
@@ -317,7 +430,7 @@ function buildHtmlResponseError(url, contentType, responseText) {
 
 function parseJsonHttpResponse(url, response, responseText) {
   const contentType = response.headers.get('content-type') || '';
-  const trimmed = String(responseText || '').trim();
+  const trimmed = redactSecrets(String(responseText || '').trim());
   const lower = trimmed.toLowerCase();
   const looksHtml =
     contentType.includes('text/html') ||
@@ -329,7 +442,7 @@ function parseJsonHttpResponse(url, response, responseText) {
     if (looksHtml) {
       throw buildHtmlResponseError(url, contentType, responseText);
     }
-    throw new Error(`OpenAI 请求失败：${response.status} ${response.statusText}\n${String(responseText || '').slice(0, 600)}`);
+    throw new Error(`OpenAI 请求失败：${response.status} ${response.statusText}\n${redactSecrets(String(responseText || '').slice(0, 600))}`);
   }
 
   if (looksHtml) {
@@ -345,19 +458,36 @@ function parseJsonHttpResponse(url, response, responseText) {
   }
 }
 
-async function postOpenAIChat(settings, body) {
-  const url = resolveChatCompletionsUrl(settings.openaiBaseUrl);
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${settings.openaiApiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
+async function postOpenAIResponse(settings, body) {
+  const url = resolveResponsesUrl(settings.openaiBaseUrl);
+  const send = async (requestBody) => {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${settings.openaiApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(requestBody),
+    });
+    const responseText = await response.text();
+    return { response, responseText };
+  };
 
-  const responseText = await response.text();
-  return parseJsonHttpResponse(url, response, responseText);
+  const requestBody = buildOpenAIRequestBody(settings, body);
+  let { response, responseText } = await send(requestBody);
+  try {
+    return parseJsonHttpResponse(url, response, responseText);
+  } catch (error) {
+    const retryWithoutReasoning =
+      requestBody.reasoning &&
+      response.status === 400 &&
+      /reasoning|unsupported|unknown parameter/i.test(String(responseText || ''));
+    if (!retryWithoutReasoning) {
+      throw error;
+    }
+    ({ response, responseText } = await send(body));
+    return parseJsonHttpResponse(url, response, responseText);
+  }
 }
 
 function emitProgress(sender, requestId, stepId, label, status, detail = null) {
@@ -429,7 +559,7 @@ function normalizeObjectiveSpec(value) {
 
 function normalizeToolPlan(value, quickMode) {
   if (quickMode) {
-    return ['construct_initial', 'validate_solution', 'compare_solutions'];
+    return ['construct_initial', 'validate_solution', 'improve_solution', 'validate_solution', 'compare_solutions'];
   }
   if (!Array.isArray(value)) {
     return undefined;
@@ -446,6 +576,10 @@ function normalizeToolPlan(value, quickMode) {
     return undefined;
   }
   return normalized;
+}
+
+function buildThinkingWarmupToolPlan() {
+  return ['construct_initial', 'validate_solution', 'compare_solutions'];
 }
 
 function normalizeSolverConfig(value, quickMode) {
@@ -492,6 +626,15 @@ function normalizeSolverConfig(value, quickMode) {
     if (typeof value.enable_local_search === 'boolean') {
       normalized.enable_local_search = value.enable_local_search;
     }
+    if (typeof value.enable_elite_guided_repair === 'boolean') {
+      normalized.enable_elite_guided_repair = value.enable_elite_guided_repair;
+    }
+    if (typeof value.decode_lookahead_as_initial === 'boolean') {
+      normalized.decode_lookahead_as_initial = value.decode_lookahead_as_initial;
+    }
+    if (typeof value.allow_worse_acceptance === 'boolean') {
+      normalized.allow_worse_acceptance = value.allow_worse_acceptance;
+    }
   }
 
   const integerFields = [
@@ -499,11 +642,22 @@ function normalizeSolverConfig(value, quickMode) {
     ['seed_trials', 1, 32],
     ['initial_candidate_count', 1, 128],
     ['lookahead_depth', 1, 8],
-    ['lookahead_beam_width', 1, 64],
+    ['lookahead_beam_width', 1, 512],
+    ['lookahead_top_k', 1, 32],
+    ['lookahead_uncertain_chunk_size', 1, 512],
     ['lookahead_per_operator_limit', 1, 64],
     ['local_search_rounds', 1, 1000],
     ['destroy_repair_rounds', 1, 1000],
     ['vehicle_reduction_rounds', 1, 1000],
+    ['granular_neighbor_k', 1, 64],
+    ['regret_k', 2, 8],
+    ['shaw_remove_count', 2, 64],
+    ['elite_guided_pool_size', 2, 64],
+    ['elite_guided_polish_rounds', 0, 128],
+    ['elite_guided_seed_trials', 1, 16],
+    ['elite_guided_candidate_count', 2, 256],
+    ['acceptance_budget', 0, 128],
+    ['random_seed', 0, 1000000],
   ];
 
   for (const [field, min, max] of integerFields) {
@@ -512,6 +666,78 @@ function normalizeSolverConfig(value, quickMode) {
     }
   }
 
+  if (value.lookahead_confident_prob !== undefined && value.lookahead_confident_prob !== null && value.lookahead_confident_prob !== '') {
+    normalized.lookahead_confident_prob = Math.max(0.5, Math.min(0.999, Number(value.lookahead_confident_prob)));
+  }
+  if (value.acceptance_temperature !== undefined && value.acceptance_temperature !== null && value.acceptance_temperature !== '') {
+    normalized.acceptance_temperature = Math.max(0.0001, Math.min(1.0, Number(value.acceptance_temperature)));
+  }
+  if (value.acceptance_decay !== undefined && value.acceptance_decay !== null && value.acceptance_decay !== '') {
+    normalized.acceptance_decay = Math.max(0.01, Math.min(1.0, Number(value.acceptance_decay)));
+  }
+
+  return normalized;
+}
+
+function normalizeRefinementStrategy(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  const source =
+    value.refinement_strategy && typeof value.refinement_strategy === 'object' ? value.refinement_strategy : value;
+  const normalized = {};
+  const localSearchOperators = normalizeOperatorList(source.local_search_operators);
+  if (localSearchOperators) {
+    normalized.local_search_operators = localSearchOperators;
+  }
+  const destroyRepairOperators = normalizeOperatorList(source.destroy_repair_operators);
+  if (destroyRepairOperators) {
+    normalized.destroy_repair_operators = destroyRepairOperators;
+  }
+  const objective = normalizeObjectiveSpec(source.objective ?? source.objective_spec);
+  if (objective) {
+    normalized.objective = objective;
+  }
+  if (typeof source.enable_destroy_repair === 'boolean') {
+    normalized.enable_destroy_repair = source.enable_destroy_repair;
+  }
+  if (typeof source.enable_vehicle_reduction === 'boolean') {
+    normalized.enable_vehicle_reduction = source.enable_vehicle_reduction;
+  }
+  if (typeof source.enable_elite_guided_repair === 'boolean') {
+    normalized.enable_elite_guided_repair = source.enable_elite_guided_repair;
+  }
+  if (typeof source.allow_worse_acceptance === 'boolean') {
+    normalized.allow_worse_acceptance = source.allow_worse_acceptance;
+  }
+
+  const integerFields = [
+    ['improvement_cycles', 1, 6],
+    ['local_search_rounds', 1, 1000],
+    ['destroy_repair_rounds', 1, 1000],
+    ['vehicle_reduction_rounds', 1, 1000],
+    ['granular_neighbor_k', 1, 64],
+    ['regret_k', 2, 8],
+    ['shaw_remove_count', 2, 64],
+    ['elite_guided_pool_size', 2, 64],
+    ['elite_guided_polish_rounds', 0, 128],
+    ['elite_guided_seed_trials', 1, 16],
+    ['elite_guided_candidate_count', 2, 256],
+    ['acceptance_budget', 0, 128],
+    ['random_seed', 0, 1000000],
+  ];
+  for (const [field, min, max] of integerFields) {
+    if (source[field] !== undefined && source[field] !== null && source[field] !== '') {
+      normalized[field] = clampInt(source[field], min, max, min);
+    }
+  }
+  if (source.acceptance_temperature !== undefined && source.acceptance_temperature !== null && source.acceptance_temperature !== '') {
+    normalized.acceptance_temperature = Math.max(0.0001, Math.min(1.0, Number(source.acceptance_temperature)));
+  }
+  if (source.acceptance_decay !== undefined && source.acceptance_decay !== null && source.acceptance_decay !== '') {
+    normalized.acceptance_decay = Math.max(0.01, Math.min(1.0, Number(source.acceptance_decay)));
+  }
   return normalized;
 }
 
@@ -523,6 +749,7 @@ function withSolveDefaults(payload, mode, settings, solverConfig = null) {
     ...normalizedSolverConfig,
   };
   const defaultSeedTrials = quickMode ? 8 : 1;
+  const defaultLocalSearchRounds = quickMode ? settings.fastLocalSearchRounds : settings.thinkingLocalSearchRounds;
 
   return {
     ...payload,
@@ -533,14 +760,48 @@ function withSolveDefaults(payload, mode, settings, solverConfig = null) {
       drl_samples: clampInt(rawConfig.drl_samples, 1, 2048, settings.drlSamples),
       seed_trials: clampInt(rawConfig.seed_trials, 1, 32, defaultSeedTrials),
       enable_lookahead: quickMode ? false : rawConfig.enable_lookahead ?? settings.enableLookahead,
-      lookahead_depth: clampInt(rawConfig.lookahead_depth, 1, 8, settings.lookaheadDepth),
-      lookahead_beam_width: clampInt(rawConfig.lookahead_beam_width, 1, 64, settings.lookaheadBeamWidth),
+      lookahead_depth: clampInt(rawConfig.lookahead_depth, 1, 8, settings.lookaheadTopK),
+      lookahead_beam_width: clampInt(rawConfig.lookahead_beam_width, 1, 512, DEFAULT_LOOKAHEAD_CHUNK_SIZE),
+      lookahead_top_k: clampInt(rawConfig.lookahead_top_k, 1, 32, settings.lookaheadTopK),
+      lookahead_confident_prob:
+        rawConfig.lookahead_confident_prob !== undefined && rawConfig.lookahead_confident_prob !== null && rawConfig.lookahead_confident_prob !== ''
+          ? Math.max(0.5, Math.min(0.999, Number(rawConfig.lookahead_confident_prob)))
+          : settings.lookaheadConfidentProb,
+      lookahead_uncertain_chunk_size: clampInt(
+        rawConfig.lookahead_uncertain_chunk_size,
+        1,
+        2048,
+        DEFAULT_LOOKAHEAD_CHUNK_SIZE,
+      ),
       lookahead_k: clampInt(rawConfig.lookahead_k, 1, 64, 1),
-      enable_local_search: quickMode ? false : rawConfig.enable_local_search ?? settings.enableLocalSearch,
-      local_search_rounds: clampInt(rawConfig.local_search_rounds, 1, 1000, settings.localSearchRounds),
+      enable_local_search: quickMode ? true : rawConfig.enable_local_search ?? true,
+      local_search_rounds: clampInt(rawConfig.local_search_rounds, 1, 1000, defaultLocalSearchRounds),
+      granular_neighbor_k: clampInt(rawConfig.granular_neighbor_k, 1, 64, quickMode ? 16 : 24),
+      regret_k: clampInt(rawConfig.regret_k, 2, 8, 3),
+      shaw_remove_count: clampInt(rawConfig.shaw_remove_count, 2, 64, quickMode ? 4 : 8),
+      enable_elite_guided_repair: quickMode ? false : rawConfig.enable_elite_guided_repair ?? false,
+      elite_guided_pool_size: clampInt(rawConfig.elite_guided_pool_size, 2, 64, 24),
+      elite_guided_polish_rounds: clampInt(rawConfig.elite_guided_polish_rounds, 0, 128, 12),
+      elite_guided_seed_trials: clampInt(rawConfig.elite_guided_seed_trials, 1, 16, 1),
+      elite_guided_candidate_count: clampInt(rawConfig.elite_guided_candidate_count, 2, 256, settings.drlSamples),
+      allow_worse_acceptance: quickMode ? false : rawConfig.allow_worse_acceptance ?? true,
+      acceptance_budget: clampInt(rawConfig.acceptance_budget, 0, 128, quickMode ? 0 : Math.max(2, Math.floor(defaultLocalSearchRounds / 6))),
+      acceptance_temperature:
+        rawConfig.acceptance_temperature !== undefined && rawConfig.acceptance_temperature !== null && rawConfig.acceptance_temperature !== ''
+          ? Math.max(0.0001, Math.min(1.0, Number(rawConfig.acceptance_temperature)))
+          : 0.01,
+      acceptance_decay:
+        rawConfig.acceptance_decay !== undefined && rawConfig.acceptance_decay !== null && rawConfig.acceptance_decay !== ''
+          ? Math.max(0.01, Math.min(1.0, Number(rawConfig.acceptance_decay)))
+          : 0.9,
+      random_seed: clampInt(rawConfig.random_seed, 0, 1000000, 0),
       ...(rawConfig.tool_plan ? { tool_plan: rawConfig.tool_plan } : {}),
       ...(rawConfig.lookahead_operators ? { lookahead_operators: rawConfig.lookahead_operators } : {}),
-      ...(rawConfig.local_search_operators ? { local_search_operators: rawConfig.local_search_operators } : {}),
+      ...(rawConfig.local_search_operators
+        ? { local_search_operators: rawConfig.local_search_operators }
+        : quickMode
+          ? { local_search_operators: ['two_opt', 'relocate', 'swap'] }
+          : {}),
       ...(rawConfig.destroy_repair_operators ? { destroy_repair_operators: rawConfig.destroy_repair_operators } : {}),
       ...(rawConfig.objective ? { objective: rawConfig.objective } : {}),
       ...(rawConfig.enable_vehicle_reduction !== undefined ? { enable_vehicle_reduction: Boolean(rawConfig.enable_vehicle_reduction) } : {}),
@@ -549,10 +810,10 @@ function withSolveDefaults(payload, mode, settings, solverConfig = null) {
         ? { initial_candidate_count: clampInt(rawConfig.initial_candidate_count, 1, 128, 1) }
         : {}),
       ...(rawConfig.lookahead_per_operator_limit !== undefined
-        ? { lookahead_per_operator_limit: clampInt(rawConfig.lookahead_per_operator_limit, 1, 64, settings.lookaheadBeamWidth) }
+        ? { lookahead_per_operator_limit: clampInt(rawConfig.lookahead_per_operator_limit, 1, 64, DEFAULT_LOOKAHEAD_CHUNK_SIZE) }
         : {}),
       ...(rawConfig.destroy_repair_rounds !== undefined
-        ? { destroy_repair_rounds: clampInt(rawConfig.destroy_repair_rounds, 1, 1000, settings.localSearchRounds) }
+        ? { destroy_repair_rounds: clampInt(rawConfig.destroy_repair_rounds, 1, 1000, defaultLocalSearchRounds) }
         : {}),
       ...(rawConfig.vehicle_reduction_rounds !== undefined
         ? { vehicle_reduction_rounds: clampInt(rawConfig.vehicle_reduction_rounds, 1, 1000, 10) }
@@ -627,9 +888,126 @@ async function runJsonModule(moduleName, options = {}) {
   throw new Error(`无法调用本地 Python 模块 ${moduleName}。\n${errors.join('\n\n')}`);
 }
 
+function createCancellationError() {
+  const error = new Error('INGEST_CANCELLED');
+  error.code = 'INGEST_CANCELLED';
+  return error;
+}
+
+function runInstanceIngestCandidate(task, candidate, filePath) {
+  return new Promise((resolve, reject) => {
+    if (task.cancelled) {
+      reject(createCancellationError());
+      return;
+    }
+
+    const child = spawn(candidate.command, [...candidate.args, '--input-file', filePath], {
+      cwd: workspaceRoot,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    task.child = child;
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on('error', (error) => {
+      reject(error);
+    });
+
+    child.on('close', (code) => {
+      if (task.cancelled) {
+        reject(createCancellationError());
+        return;
+      }
+
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `${candidate.command} exited with code ${code}`));
+        return;
+      }
+
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'unknown error';
+        reject(new Error(`instance_skill.cli 杩斿洖浜嗘棤鏁?JSON锛?{message}\n${stdout.slice(0, 600)}`));
+      }
+    });
+  });
+}
+
+async function runCancelableInstanceIngest(requestId, filePath) {
+  const taskId = typeof requestId === 'string' && requestId.trim() ? requestId.trim() : `ingest-${Date.now()}`;
+  const task = { cancelled: false, child: null };
+  pendingIngestTasks.set(taskId, task);
+
+  try {
+    const errors = [];
+    for (const candidate of createPythonCandidates('instance_skill.cli')) {
+      if (task.cancelled) {
+        throw createCancellationError();
+      }
+
+      try {
+        return await runInstanceIngestCandidate(task, candidate, filePath);
+      } catch (error) {
+        if (task.cancelled || error?.code === 'INGEST_CANCELLED' || String(error?.message || '') === 'INGEST_CANCELLED') {
+          throw createCancellationError();
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`${candidate.command}: ${message}`);
+      }
+    }
+
+    throw new Error(`鏃犳硶璋冪敤鏈湴 Python 妯″潡 instance_skill.cli銆俓n${errors.join('\n\n')}`);
+  } finally {
+    pendingIngestTasks.delete(taskId);
+  }
+}
+
+function cancelInstanceIngest(requestId) {
+  const taskId = typeof requestId === 'string' ? requestId.trim() : '';
+  if (!taskId) {
+    return false;
+  }
+
+  const task = pendingIngestTasks.get(taskId);
+  if (!task) {
+    return false;
+  }
+
+  task.cancelled = true;
+  if (task.child && !task.child.killed) {
+    try {
+      task.child.kill();
+    } catch {}
+  }
+  return true;
+}
+
 async function runInstanceIngest(filePath) {
   const execution = await runJsonModule('instance_skill.cli', {
     args: ['--input-file', filePath],
+  });
+  return execution.result;
+}
+
+async function runSolutionAnalysis(problemType, instance, solution, objective = null) {
+  const execution = await runJsonModule('tools.analyze_solution', {
+    stdinPayload: {
+      problem_type: problemType,
+      instance,
+      solution,
+      objective,
+    },
   });
   return execution.result;
 }
@@ -877,35 +1255,118 @@ function summarizePayloadForStrategy(payload) {
   };
 }
 
+function summarizeRefinementHotspots(analysis) {
+  const routes = Array.isArray(analysis?.routes) ? analysis.routes : [];
+  const hotspots = analysis?.hotspots && typeof analysis.hotspots === 'object' ? analysis.hotspots : {};
+  const longestEdges = Array.isArray(hotspots.longest_edges) ? hotspots.longest_edges : [];
+  const worstPoints = Array.isArray(hotspots.worst_connection_points) ? hotspots.worst_connection_points : [];
+  const routeCount = routes.length;
+
+  const longestEdgeRoutes = new Set(longestEdges.map((item) => Number(item?.route_index)).filter((value) => Number.isFinite(value)));
+  const worstPointRoutes = new Set(worstPoints.map((item) => Number(item?.route_index)).filter((value) => Number.isFinite(value)));
+  const affectedRoutes = new Set([...longestEdgeRoutes, ...worstPointRoutes]);
+
+  const maxEdgeDistance = longestEdges.reduce((best, item) => Math.max(best, Number(item?.distance) || 0), 0);
+  const maxExcessOverKnn = worstPoints.reduce((best, item) => Math.max(best, Number(item?.excess_over_knn) || 0), 0);
+  const waitingTime = Number(analysis?.summary?.max_waiting_time) || 0;
+
+  const concentrated =
+    affectedRoutes.size > 0 &&
+    ((routeCount > 0 && affectedRoutes.size <= Math.max(1, Math.ceil(routeCount / 3))) || affectedRoutes.size <= 2);
+
+  const diffuse =
+    routeCount > 0 &&
+    affectedRoutes.size >= Math.max(3, Math.ceil(routeCount * 0.6));
+
+  const severe =
+    maxExcessOverKnn >= 20 ||
+    maxEdgeDistance >= 20 ||
+    waitingTime >= 30;
+
+  return {
+    route_count: routeCount,
+    longest_edge_count: longestEdges.length,
+    worst_connection_point_count: worstPoints.length,
+    affected_route_count: affectedRoutes.size,
+    max_edge_distance: maxEdgeDistance,
+    max_excess_over_knn: maxExcessOverKnn,
+    max_waiting_time: waitingTime,
+    pattern: diffuse ? 'diffuse' : concentrated ? 'concentrated' : 'mixed',
+    severity: severe ? 'high' : maxExcessOverKnn >= 10 || maxEdgeDistance >= 12 || waitingTime >= 15 ? 'medium' : 'low',
+    top_longest_edges: longestEdges.slice(0, 3),
+    top_worst_connection_points: worstPoints.slice(0, 3),
+  };
+}
+
+function buildEliteGuidedFallbackStrategy(analysis, baseSolverConfig = {}, settings = defaultSettings) {
+  const hotspotSummary = summarizeRefinementHotspots(analysis);
+  const drlSamples = Math.max(2, Number(baseSolverConfig?.drl_samples || settings.drlSamples || 128));
+
+  let enableEliteGuidedRepair = false;
+  let eliteGuidedPoolSize = 16;
+  let eliteGuidedPolishRounds = 8;
+  let eliteGuidedCandidateCount = Math.min(64, drlSamples);
+
+  if (hotspotSummary.severity === 'high' && hotspotSummary.pattern === 'diffuse') {
+    enableEliteGuidedRepair = true;
+    eliteGuidedPoolSize = Math.min(48, drlSamples);
+    eliteGuidedPolishRounds = 18;
+    eliteGuidedCandidateCount = Math.min(128, drlSamples);
+  } else if (hotspotSummary.severity === 'high' && hotspotSummary.pattern === 'concentrated') {
+    enableEliteGuidedRepair = true;
+    eliteGuidedPoolSize = Math.min(24, drlSamples);
+    eliteGuidedPolishRounds = 12;
+    eliteGuidedCandidateCount = Math.min(96, drlSamples);
+  } else if (hotspotSummary.severity === 'medium' && hotspotSummary.pattern !== 'mixed') {
+    enableEliteGuidedRepair = true;
+    eliteGuidedPoolSize = Math.min(20, drlSamples);
+    eliteGuidedPolishRounds = 10;
+    eliteGuidedCandidateCount = Math.min(64, drlSamples);
+  }
+
+  return {
+    local_search_operators: ['or_opt', 'two_opt_star', 'cross_exchange', 'relocate', 'swap', 'two_opt'],
+    destroy_repair_operators: ['shaw_regret', 'route_elimination', 'or_opt', 'relocate', 'swap', 'two_opt'],
+    enable_destroy_repair: true,
+    enable_vehicle_reduction: false,
+    enable_elite_guided_repair: enableEliteGuidedRepair,
+    allow_worse_acceptance: true,
+    acceptance_budget: 6,
+    acceptance_temperature: 0.01,
+    acceptance_decay: 0.9,
+    granular_neighbor_k: 24,
+    regret_k: 3,
+    shaw_remove_count: 8,
+    elite_guided_pool_size: eliteGuidedPoolSize,
+    elite_guided_polish_rounds: eliteGuidedPolishRounds,
+    elite_guided_seed_trials: 1,
+    elite_guided_candidate_count: eliteGuidedCandidateCount,
+  };
+}
+
 async function requestSolverStrategy(text, settings, mode, payload, ingestResults) {
   if (!settings.openaiApiKey || mode !== 'thinking') {
     return {};
   }
 
   try {
-    const parsedResponse = await postOpenAIChat(settings, {
+    const parsedResponse = await postOpenAIResponse(settings, {
       model: settings.openaiModel,
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: solverStrategyPrompt },
-        {
-          role: 'user',
-          content: [
-            `User request: ${text || '(empty)'}`,
-            `Mode: ${mode}`,
-            `Payload summary: ${JSON.stringify(summarizePayloadForStrategy(payload))}`,
-            Array.isArray(ingestResults) && ingestResults.length > 0
-              ? `Uploaded summaries: ${JSON.stringify(ingestResults.map((item) => item.summary).filter(Boolean))}`
-              : null,
-          ]
-            .filter(Boolean)
-            .join('\n'),
-        },
-      ],
+      store: false,
+      instructions: solverStrategyPrompt,
+      input: [
+        `User request: ${text || '(empty)'}`,
+        `Mode: ${mode}`,
+        `Payload summary: ${JSON.stringify(summarizePayloadForStrategy(payload))}`,
+        Array.isArray(ingestResults) && ingestResults.length > 0
+          ? `Uploaded summaries: ${JSON.stringify(ingestResults.map((item) => item.summary).filter(Boolean))}`
+          : null,
+      ]
+        .filter(Boolean)
+        .join('\n'),
     });
 
-    const structuredText = extractStructuredText(getMessageText(parsedResponse?.choices?.[0]));
+    const structuredText = extractStructuredText(getResponseText(parsedResponse));
     if (!structuredText) {
       return {};
     }
@@ -917,81 +1378,79 @@ async function requestSolverStrategy(text, settings, mode, payload, ingestResult
   }
 }
 
-function hasExplicitSolveIntent(text) {
-  const content = String(text || '').trim();
-  return /(全部求解|批量求解|直接求解|开始求解|求解上传|求解这些|求解这批|solve all|solve uploaded|solve these|optimi[sz]e uploaded)/i.test(content);
+function buildRefinementToolPlan(strategy) {
+  const cycles = Math.max(1, Number(strategy.improvement_cycles || 2));
+  const plan = ['validate_solution'];
+  if (strategy.enable_elite_guided_repair) {
+    plan.push('elite_guided_repair', 'validate_solution');
+  }
+  if (strategy.enable_vehicle_reduction) {
+    plan.push('reduce_vehicles', 'validate_solution');
+  }
+  for (let index = 0; index < cycles; index += 1) {
+    if (strategy.enable_destroy_repair) {
+      plan.push('destroy_repair', 'validate_solution');
+    }
+    plan.push('improve_solution', 'validate_solution');
+  }
+  plan.push('compare_solutions');
+  return plan;
 }
 
-function maybeShortCircuitSolveDecision(text, ingestResult) {
-  const hasUploads = Array.isArray(ingestResult) ? ingestResult.length > 0 : Boolean(ingestResult);
-  if (!hasUploads) {
-    return null;
-  }
-
-  if (!String(text || '').trim()) {
-    return { action: 'solve', use_uploaded_payload: true, shortCircuited: true };
-  }
-
-  if (hasExplicitSolveIntent(text)) {
-    return { action: 'solve', use_uploaded_payload: true, shortCircuited: true };
-  }
-
-  return null;
-}
-
-function heuristicAgentDecision(text, ingestResult) {
-  const content = String(text || '').trim();
-  const solveIntent = /(求解|优化|路线|路径|排程|构造解|跑一下|运行|drl|lookahead|局部搜索|solve|optimi[sz]e|vrp|tsp|cvrp|cvrptw)/i.test(content);
-  const explainIntent = /(解释|说明|是什么|为什么|怎么|如何|介绍|必要|有必要|rag|skill|设置)/i.test(content);
-  const hasUploads = Array.isArray(ingestResult) ? ingestResult.length > 0 : Boolean(ingestResult);
-
-  if (!content && hasUploads) {
-    return {
-      action: 'reply',
-      message: '我已经收到上传的实例文件。请明确说明是要求解、分析、转换格式，还是解释这个实例。',
-    };
-  }
-  if (hasUploads && solveIntent) {
-    return { action: 'solve', use_uploaded_payload: true };
-  }
-  if (explainIntent && !solveIntent) {
-    return {
-      action: 'reply',
-      message: '当前输入更像普通对话或说明请求，我不会直接调用求解 skill。若你要我求解，请明确说“求解这个实例”或“优化上传实例”。',
-    };
-  }
-  if (solveIntent) {
-    return {
-      action: 'reply',
-      message: '我判断你是想求解，但当前还缺少可直接求解的结构化信息。请上传实例文件、粘贴 JSON payload，或配置 OpenAI Key 让我先做结构化。',
-    };
-  }
-  return {
-    action: 'reply',
-    message: '我先不调用求解 skill。你可以继续提问，或明确说明需要我对哪个实例执行求解。',
-  };
-}
-
-async function requestAgentDecision(text, settings, conversation, ingestResult) {
-  const shortCircuitDecision = maybeShortCircuitSolveDecision(text, ingestResult);
-  if (shortCircuitDecision) {
-    return shortCircuitDecision;
-  }
-
+async function requestRefinementStrategy(text, settings, payload, analysis, baseSolverConfig = {}) {
+  const fallbackStrategy = buildEliteGuidedFallbackStrategy(analysis, { ...baseSolverConfig, ...payload?.config }, settings);
   if (!settings.openaiApiKey) {
-    return heuristicAgentDecision(text, ingestResult);
+    return fallbackStrategy;
   }
 
-  const parsedResponse = await postOpenAIChat(settings, {
+  try {
+    const hotspotSummary = summarizeRefinementHotspots(analysis);
+    const parsedResponse = await postOpenAIResponse(settings, {
+      model: settings.openaiModel,
+      store: false,
+      instructions: refinementStrategyPrompt,
+      input: [
+        `User request: ${text || '(empty)'}`,
+        `Problem type: ${payload.problem_type}`,
+        `DRL samples: ${payload.config?.drl_samples ?? baseSolverConfig.drl_samples ?? settings.drlSamples}`,
+        `Current objective: ${JSON.stringify(baseSolverConfig.objective ?? payload.config?.objective ?? null)}`,
+        `Elite-guided hotspot summary: ${JSON.stringify(hotspotSummary)}`,
+        `Current solution analysis: ${JSON.stringify(analysis)}`,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    });
+
+    const structuredText = extractStructuredText(getResponseText(parsedResponse));
+    if (!structuredText) {
+      return fallbackStrategy;
+    }
+    const parsed = parseJsonObject(structuredText);
+    return {
+      ...fallbackStrategy,
+      ...normalizeRefinementStrategy(parsed.refinement_strategy ?? parsed),
+    };
+  } catch {
+    return fallbackStrategy;
+  }
+}
+
+async function requestAgentDecision(text, settings, conversation, ingestResult, previousResponseId = null) {
+  if (!settings.openaiApiKey) {
+    return {
+      action: 'reply',
+      message: '当前未配置可用的 OpenAI API key，无法让模型判断意图。请先在设置中保存正确的 API key。',
+      agentPreviousResponseId: null,
+    };
+  }
+
+  const parsedResponse = await postOpenAIResponse(settings, {
     model: settings.openaiModel,
-    temperature: 0.1,
-    response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: agentDecisionPrompt },
-      { role: 'user', content: buildAgentUserPrompt(text, conversation, ingestResult) },
-    ],
+    store: false,
+    instructions: agentDecisionPrompt,
+    input: buildAgentUserPrompt(text, conversation, ingestResult),
   });
-  const structuredText = extractStructuredText(getMessageText(parsedResponse?.choices?.[0]));
+  const structuredText = extractStructuredText(getResponseText(parsedResponse));
   if (!structuredText) {
     throw new Error('模型没有返回 agent 决策结果。');
   }
@@ -1000,6 +1459,7 @@ async function requestAgentDecision(text, settings, conversation, ingestResult) 
   return {
     ...decision,
     structuredText,
+    agentPreviousResponseId: null,
   };
 }
 
@@ -1010,33 +1470,27 @@ async function requestConversationTitle(settings, context) {
   }
 
   try {
-    const parsedResponse = await postOpenAIChat(settings, {
+    const parsedResponse = await postOpenAIResponse(settings, {
       model: settings.openaiModel,
-      temperature: 0.2,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: conversationTitlePrompt },
-        {
-          role: 'user',
-          content: [
-            `User message: ${context.text || '(empty)'}`,
-            Array.isArray(context.uploadedFiles) && context.uploadedFiles.length > 0
-              ? `Uploaded files: ${context.uploadedFiles.map((file) => file.name).join(', ')}`
-              : null,
-            Array.isArray(context.ingestResults) && context.ingestResults.length > 0
-              ? `Instance summaries: ${JSON.stringify(context.ingestResults.map((item) => item.summary))}`
-              : null,
-            context.replyMessage ? `Assistant reply: ${context.replyMessage}` : null,
-            context.payload?.problem_type ? `Problem type: ${context.payload.problem_type}` : null,
-            context.solveResult ? `Solved distance: ${context.solveResult.final_solution?.distance ?? ''}` : null,
-          ]
-            .filter(Boolean)
-            .join('\n'),
-        },
-      ],
+      store: false,
+      instructions: conversationTitlePrompt,
+      input: [
+        `User message: ${context.text || '(empty)'}`,
+        Array.isArray(context.uploadedFiles) && context.uploadedFiles.length > 0
+          ? `Uploaded files: ${context.uploadedFiles.map((file) => file.name).join(', ')}`
+          : null,
+        Array.isArray(context.ingestResults) && context.ingestResults.length > 0
+          ? `Instance summaries: ${JSON.stringify(context.ingestResults.map((item) => item.summary))}`
+          : null,
+        context.replyMessage ? `Assistant reply: ${context.replyMessage}` : null,
+        context.payload?.problem_type ? `Problem type: ${context.payload.problem_type}` : null,
+        context.solveResult ? `Solved distance: ${context.solveResult.final_solution?.distance ?? ''}` : null,
+      ]
+        .filter(Boolean)
+        .join('\n'),
     });
 
-    const structuredText = extractStructuredText(getMessageText(parsedResponse?.choices?.[0]));
+    const structuredText = extractStructuredText(getResponseText(parsedResponse));
     if (!structuredText) {
       return fallbackTitle;
     }
@@ -1052,16 +1506,22 @@ async function solveRequest(event, request) {
   const requestId = typeof request?.requestId === 'string' && request.requestId.trim() ? request.requestId.trim() : `req-${Date.now()}`;
   const text = typeof request?.text === 'string' ? request.text.trim() : '';
   const mode = request?.mode === 'thinking' ? 'thinking' : 'quick';
-  const settings = sanitizeSettings(request?.settings);
+  const settings = resolveEffectiveSettings(request?.settings);
   const conversation = Array.isArray(request?.conversation) ? request.conversation : [];
+  const agentPreviousResponseId =
+    typeof request?.agentPreviousResponseId === 'string' && request.agentPreviousResponseId.trim()
+      ? request.agentPreviousResponseId.trim()
+      : null;
   const sender = event.sender;
   const uploadedFiles = normalizeUploadedFiles(request);
+  const preparsedIngestResults = Array.isArray(request?.preparsedIngestResults) ? request.preparsedIngestResults : [];
 
   if (!text && uploadedFiles.length === 0) {
     throw new Error('请输入消息，或先上传实例文件。');
   }
 
   const ingestResults = [];
+  const ingestResultByPath = new Map();
   let payload = null;
   let payloadSource = 'json';
   let structuredText = null;
@@ -1070,9 +1530,24 @@ async function solveRequest(event, request) {
 
   emitProgress(sender, requestId, 'receive', '接收请求', 'completed', null);
 
+  for (const entry of preparsedIngestResults) {
+    if (!entry || typeof entry !== 'object' || typeof entry.path !== 'string' || !entry.ingestResult || typeof entry.ingestResult !== 'object') {
+      continue;
+    }
+    const normalizedPath = entry.path.trim();
+    if (!normalizedPath || ingestResultByPath.has(normalizedPath)) {
+      continue;
+    }
+    ingestResultByPath.set(normalizedPath, entry.ingestResult);
+    ingestResults.push(entry.ingestResult);
+  }
+
   if (uploadedFiles.length > 0) {
     for (let index = 0; index < uploadedFiles.length; index += 1) {
       const file = uploadedFiles[index];
+      if (ingestResultByPath.has(file.path)) {
+        continue;
+      }
       emitProgress(
         sender,
         requestId,
@@ -1081,7 +1556,9 @@ async function solveRequest(event, request) {
         'running',
         file.name,
       );
-      ingestResults.push(await runInstanceIngest(file.path));
+      const ingestResult = await runInstanceIngest(file.path);
+      ingestResultByPath.set(file.path, ingestResult);
+      ingestResults.push(ingestResult);
     }
     emitProgress(
       sender,
@@ -1093,12 +1570,8 @@ async function solveRequest(event, request) {
     );
   }
   emitProgress(sender, requestId, 'decision', '由模型判断是否调用求解 skill', 'running', null);
-  const decision = await requestAgentDecision(text, settings, conversation, ingestResults);
-  const decisionDetail = decision.shortCircuited
-    ? !text
-      ? '检测到已上传实例，直接开始求解。'
-      : '检测到明确求解指令，直接使用已上传实例求解。'
-    : null;
+  const decision = await requestAgentDecision(text, settings, conversation, ingestResults, agentPreviousResponseId);
+  const decisionDetail = typeof decision.structuredText === 'string' && decision.structuredText.trim() ? '已由模型返回决策。' : null;
 
   if (decision.action === 'reply') {
     if (conversation.length === 0) {
@@ -1118,6 +1591,7 @@ async function solveRequest(event, request) {
       message: typeof decision.message === 'string' && decision.message.trim() ? decision.message.trim() : '我先不调用求解器。请继续说明你的需求。',
       durationMs: Date.now() - startedAt,
       suggestedTitle,
+      agentPreviousResponseId: decision.agentPreviousResponseId ?? agentPreviousResponseId,
     };
   }
 
@@ -1185,6 +1659,7 @@ async function solveRequest(event, request) {
       kind: 'solve',
       durationMs: Date.now() - startedAt,
       suggestedTitle,
+      agentPreviousResponseId: decision.agentPreviousResponseId ?? agentPreviousResponseId,
       solveResponse: {
         payload: firstBatchItem.payload,
         payloadSource: firstBatchItem.payloadSource,
@@ -1198,10 +1673,133 @@ async function solveRequest(event, request) {
     };
   }
 
-  const normalizedPayload = withSolveDefaults(payload, mode, settings, solverConfig);
-  emitProgress(sender, requestId, 'solve', '调用本地求解链', 'running', normalizedPayload.problem_type);
-  const solveResult = await runSolverWithProgress(sender, requestId, normalizedPayload);
-  emitProgress(sender, requestId, 'solve', '本地求解链完成', 'completed', normalizedPayload.problem_type);
+  let finalPayload = withSolveDefaults(payload, mode, settings, solverConfig);
+  let finalResult = null;
+  let finalDurationMs = 0;
+
+  if (mode === 'thinking' && settings.openaiApiKey) {
+    const warmupSolverConfig = {
+      ...solverConfig,
+      enable_lookahead: true,
+      enable_local_search: false,
+      enable_destroy_repair: false,
+      enable_vehicle_reduction: false,
+      decode_lookahead_as_initial: true,
+      tool_plan: buildThinkingWarmupToolPlan(),
+    };
+    const warmupPayload = withSolveDefaults(payload, mode, settings, warmupSolverConfig);
+    emitProgress(sender, requestId, 'solve', '运行 lookahead 预热阶段', 'running', warmupPayload.problem_type);
+    const warmupSolve = await runSolverWithProgress(sender, requestId, warmupPayload);
+    emitProgress(sender, requestId, 'solve', 'lookahead 预热阶段完成', 'completed', warmupPayload.problem_type);
+
+    const warmupResult = warmupSolve.result;
+    const lookaheadBaseSolution = warmupResult.lookahead_solution ?? warmupResult.final_solution;
+
+    emitProgress(sender, requestId, 'analysis', '分析当前解', 'running', '生成路线统计与等待热点');
+    const analysis = await runSolutionAnalysis(
+      warmupPayload.problem_type,
+      warmupPayload.instance,
+      lookaheadBaseSolution,
+      warmupPayload.config?.objective ?? null,
+    );
+    emitProgress(sender, requestId, 'analysis', '分析当前解', 'completed', '已生成路线诊断');
+
+    emitProgress(sender, requestId, 'refine_plan', '由模型选择改进算子', 'running', null);
+    const requestedRefinement = await requestRefinementStrategy(text, settings, warmupPayload, analysis, solverConfig);
+    const refinementStrategy = {
+      local_search_operators:
+        requestedRefinement.local_search_operators ?? solverConfig.local_search_operators ?? ['or_opt', 'two_opt_star', 'cross_exchange', 'relocate', 'swap', 'two_opt'],
+      destroy_repair_operators:
+        requestedRefinement.destroy_repair_operators ?? solverConfig.destroy_repair_operators ?? ['shaw_regret', 'route_elimination', 'or_opt', 'relocate', 'swap', 'two_opt'],
+      local_search_rounds:
+        requestedRefinement.local_search_rounds ??
+        solverConfig.local_search_rounds ??
+        warmupPayload.config?.local_search_rounds ??
+        settings.thinkingLocalSearchRounds,
+      destroy_repair_rounds:
+        requestedRefinement.destroy_repair_rounds ??
+        solverConfig.destroy_repair_rounds ??
+        warmupPayload.config?.destroy_repair_rounds ??
+        settings.thinkingLocalSearchRounds,
+      vehicle_reduction_rounds: requestedRefinement.vehicle_reduction_rounds ?? solverConfig.vehicle_reduction_rounds ?? 10,
+      improvement_cycles: requestedRefinement.improvement_cycles ?? 2,
+      enable_destroy_repair: requestedRefinement.enable_destroy_repair ?? true,
+      enable_vehicle_reduction: requestedRefinement.enable_vehicle_reduction ?? false,
+      enable_elite_guided_repair: requestedRefinement.enable_elite_guided_repair ?? solverConfig.enable_elite_guided_repair ?? false,
+      allow_worse_acceptance: requestedRefinement.allow_worse_acceptance ?? solverConfig.allow_worse_acceptance ?? true,
+      acceptance_budget: requestedRefinement.acceptance_budget ?? solverConfig.acceptance_budget ?? 6,
+      acceptance_temperature: requestedRefinement.acceptance_temperature ?? solverConfig.acceptance_temperature ?? 0.01,
+      acceptance_decay: requestedRefinement.acceptance_decay ?? solverConfig.acceptance_decay ?? 0.9,
+      granular_neighbor_k: requestedRefinement.granular_neighbor_k ?? solverConfig.granular_neighbor_k ?? 24,
+      regret_k: requestedRefinement.regret_k ?? solverConfig.regret_k ?? 3,
+      shaw_remove_count: requestedRefinement.shaw_remove_count ?? solverConfig.shaw_remove_count ?? 8,
+      elite_guided_pool_size: requestedRefinement.elite_guided_pool_size ?? solverConfig.elite_guided_pool_size ?? 24,
+      elite_guided_polish_rounds: requestedRefinement.elite_guided_polish_rounds ?? solverConfig.elite_guided_polish_rounds ?? 12,
+      elite_guided_seed_trials: requestedRefinement.elite_guided_seed_trials ?? solverConfig.elite_guided_seed_trials ?? 1,
+      elite_guided_candidate_count:
+        requestedRefinement.elite_guided_candidate_count ?? solverConfig.elite_guided_candidate_count ?? settings.drlSamples,
+      objective: requestedRefinement.objective ?? solverConfig.objective ?? warmupPayload.config?.objective ?? null,
+    };
+    emitProgress(
+      sender,
+      requestId,
+      'refine_plan',
+      '由模型选择改进算子',
+      'completed',
+      `cycles=${refinementStrategy.improvement_cycles}`,
+    );
+
+    const refinementPayload = withSolveDefaults(
+      {
+        ...payload,
+        starting_solution: lookaheadBaseSolution,
+      },
+      mode,
+      settings,
+      {
+        ...solverConfig,
+        ...refinementStrategy,
+        enable_lookahead: false,
+        enable_local_search: true,
+        tool_plan: buildRefinementToolPlan(refinementStrategy),
+      },
+    );
+    emitProgress(sender, requestId, 'solve', '运行多轮改进阶段', 'running', refinementPayload.problem_type);
+    const refinementSolve = await runSolverWithProgress(sender, requestId, refinementPayload);
+    emitProgress(sender, requestId, 'solve', '多轮改进阶段完成', 'completed', refinementPayload.problem_type);
+
+    finalPayload = {
+      ...warmupPayload,
+      config: refinementPayload.config,
+    };
+    finalResult = {
+      ...warmupResult,
+      local_search_solution: refinementSolve.result.local_search_solution ?? refinementSolve.result.final_solution,
+      final_solution: refinementSolve.result.final_solution,
+      meta: {
+        ...warmupResult.meta,
+        ...refinementSolve.result.meta,
+        lookahead_solution_used_for_refinement: lookaheadBaseSolution,
+        warmup_analysis: analysis,
+        refinement_strategy: refinementStrategy,
+        tool_plan: [
+          ...(Array.isArray(warmupResult.meta?.tool_plan) ? warmupResult.meta.tool_plan : []),
+          ...(Array.isArray(refinementSolve.result.meta?.tool_plan) ? refinementSolve.result.meta.tool_plan : []),
+        ],
+        tool_trace: [
+          ...(Array.isArray(warmupResult.meta?.tool_trace) ? warmupResult.meta.tool_trace : []),
+          ...(Array.isArray(refinementSolve.result.meta?.tool_trace) ? refinementSolve.result.meta.tool_trace : []),
+        ],
+      },
+    };
+    finalDurationMs = warmupSolve.durationMs + refinementSolve.durationMs;
+  } else {
+    emitProgress(sender, requestId, 'solve', '调用本地求解链', 'running', finalPayload.problem_type);
+    const solveExecution = await runSolverWithProgress(sender, requestId, finalPayload);
+    emitProgress(sender, requestId, 'solve', '本地求解链完成', 'completed', finalPayload.problem_type);
+    finalResult = solveExecution.result;
+    finalDurationMs = solveExecution.durationMs;
+  }
 
   if (conversation.length === 0) {
     suggestedTitle = await requestConversationTitle(settings, {
@@ -1209,8 +1807,8 @@ async function solveRequest(event, request) {
       uploadedFiles,
       ingestResults,
       replyMessage: null,
-      payload: normalizedPayload,
-      solveResult: solveResult.result,
+      payload: finalPayload,
+      solveResult: finalResult,
     });
   }
 
@@ -1218,11 +1816,12 @@ async function solveRequest(event, request) {
     kind: 'solve',
     durationMs: Date.now() - startedAt,
     suggestedTitle,
+    agentPreviousResponseId: decision.agentPreviousResponseId ?? agentPreviousResponseId,
     solveResponse: {
-      payload: normalizedPayload,
+      payload: finalPayload,
       payloadSource,
-      result: solveResult.result,
-      durationMs: solveResult.durationMs,
+      result: finalResult,
+      durationMs: finalDurationMs,
       structuredText,
       ingestResult: ingestResults[0] ?? null,
       runtimeDefaults: buildRuntimeDefaultsPayload(),
@@ -1240,7 +1839,7 @@ function createWindow() {
     show: false,
     autoHideMenuBar: true,
     backgroundColor: '#ffffff',
-    title: 'VRP Agent',
+    title: 'Route AI',
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -1334,6 +1933,13 @@ app.whenReady().then(() => {
     fs.writeFileSync(result.filePath, `${JSON.stringify(request?.data ?? {}, null, 2)}\n`, 'utf8');
     return result.filePath;
   });
+  ipcMain.handle('solver:ingest-file', async (_event, request) => {
+    if (!request || typeof request.path !== 'string' || !request.path.trim()) {
+      throw new Error('Missing ingest file path.');
+    }
+    return runCancelableInstanceIngest(request.requestId, request.path.trim());
+  });
+  ipcMain.handle('solver:cancel-ingest', (_event, requestId) => cancelInstanceIngest(requestId));
   ipcMain.handle('solver:solve', (event, request) => solveRequest(event, request));
 
   createWindow();

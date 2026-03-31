@@ -2,13 +2,14 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { ChatThread } from './components/ChatThread';
 import { Header } from './components/Header';
 import { HistorySidebar } from './components/HistorySidebar';
-import { InputArea } from './components/InputArea';
+import { InputArea, type InputAttachmentItem } from './components/InputArea';
 import { ResultView } from './components/ResultView';
 import { SettingsModal } from './components/SettingsModal';
 import { SolvingProcess } from './components/SolvingProcess';
 import {
-  appendReplyTurn,
-  appendSolveTurn,
+  appendAssistantReplyMessage,
+  appendAssistantSolveMessage,
+  appendUserTurn,
   buildConversationContext,
   createEmptySession,
   createId,
@@ -24,6 +25,8 @@ import { defaultSettings, loadSettings, saveSettings } from './lib/settings';
 import type { AppSettings } from './types/settings';
 import type {
   DesktopAgentResponse,
+  DesktopIngestResult,
+  DesktopPreparedIngestResult,
   DesktopProgressEvent,
   DesktopSolveResponse,
   DesktopUploadedFileRef,
@@ -31,6 +34,16 @@ import type {
 } from './types/solver';
 
 type AppState = 'idle' | 'solving' | 'result';
+
+type UploadItem = {
+  id: string;
+  path: string;
+  name: string;
+  status: 'parsing' | 'ready' | 'error';
+  ingestResult: DesktopIngestResult | null;
+  parseRequestId: string | null;
+  error: string | null;
+};
 
 const initialSessions = ensureSessions(loadChatSessions());
 const initialActiveSessionId = (() => {
@@ -53,18 +66,23 @@ function normalizeSessionTitle(title: string | null | undefined): string | null 
   if (typeof title !== 'string') {
     return null;
   }
-  const normalized = title.trim().replace(/\s+/g, ' ').replace(/^["'“”]+|["'“”]+$/g, '');
+  const normalized = title.trim().replace(/\s+/g, ' ').replace(/^["']+|["']+$/g, '');
   if (!normalized) {
     return null;
   }
   return normalized.length > 24 ? normalized.slice(0, 24) : normalized;
 }
 
+function isIngestCancelled(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /INGEST_CANCELLED/i.test(message);
+}
+
 export default function App() {
   const [appState, setAppState] = useState<AppState>('idle');
   const [mode, setMode] = useState<SolveMode>('quick');
   const [inputText, setInputText] = useState('');
-  const [uploadedFiles, setUploadedFiles] = useState<DesktopUploadedFileRef[]>([]);
+  const [uploadedFiles, setUploadedFiles] = useState<UploadItem[]>([]);
   const [isPickingFiles, setIsPickingFiles] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -74,6 +92,7 @@ export default function App() {
   const [currentSessionId, setCurrentSessionId] = useState(initialActiveSessionId);
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
   const [progressEvents, setProgressEvents] = useState<DesktopProgressEvent[]>([]);
+  const [pendingAssistantSessionId, setPendingAssistantSessionId] = useState<string | null>(null);
 
   useEffect(() => {
     loadSettings().then(setSettings).catch(() => setSettings(defaultSettings));
@@ -111,9 +130,47 @@ export default function App() {
 
   const latestSessionResult = getLatestSolveResponse(currentSession);
 
+  const attachmentViewModels = useMemo<InputAttachmentItem[]>(
+    () =>
+      uploadedFiles.map((file) => ({
+        id: file.id,
+        name: file.name,
+        status: file.status,
+        error: file.error,
+      })),
+    [uploadedFiles],
+  );
+
   const handleSaveSettings = async (nextSettings: AppSettings) => {
     const persisted = await saveSettings(nextSettings);
     setSettings(persisted);
+  };
+
+  const startBackgroundIngest = (file: DesktopUploadedFileRef, itemId: string, parseRequestId: string) => {
+    void window.desktopApp?.solver
+      ?.ingestFile({ requestId: parseRequestId, path: file.path })
+      .then((ingestResult) => {
+        setUploadedFiles((previous) =>
+          previous.map((item) =>
+            item.id === itemId && item.parseRequestId === parseRequestId
+              ? { ...item, status: 'ready', ingestResult, parseRequestId: null, error: null }
+              : item,
+          ),
+        );
+      })
+      .catch((error) => {
+        if (isIngestCancelled(error)) {
+          return;
+        }
+        const message = error instanceof Error ? error.message : '实例解析失败';
+        setUploadedFiles((previous) =>
+          previous.map((item) =>
+            item.id === itemId && item.parseRequestId === parseRequestId
+              ? { ...item, status: 'error', ingestResult: null, parseRequestId: null, error: message }
+              : item,
+          ),
+        );
+      });
   };
 
   const handlePickFiles = async () => {
@@ -124,16 +181,35 @@ export default function App() {
         return;
       }
 
-      setUploadedFiles((previous) => {
-        const next = [...previous];
-        for (const file of files) {
-          if (!next.some((item) => item.path === file.path)) {
-            next.push({ path: file.path, name: file.name });
-          }
-        }
-        return next;
+      const existingPaths = new Set(uploadedFiles.map((file) => file.path));
+      const freshFiles = files.filter((file) => !existingPaths.has(file.path));
+      if (freshFiles.length === 0) {
+        return;
+      }
+
+      const queued = freshFiles.map((file) => {
+        const itemId = createId('upload');
+        const parseRequestId = createId('ingest');
+        return {
+          file,
+          item: {
+            id: itemId,
+            path: file.path,
+            name: file.name,
+            status: 'parsing' as const,
+            ingestResult: null,
+            parseRequestId,
+            error: null,
+          },
+        };
       });
+
+      setUploadedFiles((previous) => [...previous, ...queued.map((entry) => entry.item)]);
       setErrorMessage(null);
+
+      for (const entry of queued) {
+        startBackgroundIngest(entry.file, entry.item.id, entry.item.parseRequestId);
+      }
     } finally {
       setIsPickingFiles(false);
     }
@@ -150,6 +226,7 @@ export default function App() {
     setActiveResult(null);
     setActiveRequestId(null);
     setProgressEvents([]);
+    setPendingAssistantSessionId(null);
     setAppState('idle');
   };
 
@@ -162,6 +239,7 @@ export default function App() {
     setActiveResult(null);
     setActiveRequestId(null);
     setProgressEvents([]);
+    setPendingAssistantSessionId(null);
     setAppState('idle');
   };
 
@@ -179,24 +257,26 @@ export default function App() {
       setActiveResult(null);
       setActiveRequestId(null);
       setProgressEvents([]);
+      setPendingAssistantSessionId(null);
       setAppState('idle');
     }
   };
 
-  const handleAgentResponse = (response: DesktopAgentResponse, requestId: string, requestText: string) => {
+  const handleAgentResponse = (response: DesktopAgentResponse, requestId: string, sessionId: string) => {
     const suggestedTitle = normalizeSessionTitle(response.suggestedTitle);
 
     if (response.kind === 'reply') {
       setSessions((previous) =>
         previous.map((session) =>
-          session.id === currentSessionId
+          session.id === sessionId
             ? (() => {
-                const appended = appendReplyTurn(session, { text: requestText, uploadedFiles, mode }, response.message);
-                return suggestedTitle && session.title === '新对话' ? { ...appended, title: suggestedTitle } : appended;
+                const appended = appendAssistantReplyMessage(session, response.message, response.agentPreviousResponseId);
+                return suggestedTitle && session.title === '鏂板璇?' ? { ...appended, title: suggestedTitle } : appended;
               })()
             : session,
         ),
       );
+      setPendingAssistantSessionId((current) => (current === sessionId ? null : current));
       setActiveRequestId(null);
       setAppState('idle');
       return;
@@ -204,15 +284,16 @@ export default function App() {
 
     setSessions((previous) =>
       previous.map((session) =>
-        session.id === currentSessionId
+        session.id === sessionId
           ? (() => {
-              const appended = appendSolveTurn(session, { text: requestText, uploadedFiles, mode }, response.solveResponse);
-              return suggestedTitle && session.title === '新对话' ? { ...appended, title: suggestedTitle } : appended;
+              const appended = appendAssistantSolveMessage(session, response.solveResponse, response.agentPreviousResponseId);
+              return suggestedTitle && session.title === '鏂板璇?' ? { ...appended, title: suggestedTitle } : appended;
             })()
           : session,
       ),
     );
 
+    setPendingAssistantSessionId((current) => (current === sessionId ? null : current));
     setActiveResult(response.solveResponse);
     setActiveRequestId(null);
     setAppState('result');
@@ -228,23 +309,57 @@ export default function App() {
     );
   };
 
+  const handleRemoveSelectedFile = (index: number) => {
+    setUploadedFiles((previous) => {
+      const target = previous[index];
+      if (target?.status === 'parsing' && target.parseRequestId) {
+        void window.desktopApp?.solver?.cancelIngest?.(target.parseRequestId);
+      }
+      return previous.filter((_, fileIndex) => fileIndex !== index);
+    });
+  };
+
   const handleSend = async () => {
     const text = inputText.trim();
-    if (!text && uploadedFiles.length === 0) {
+    const usableUploads = uploadedFiles.filter((file) => file.status !== 'error');
+
+    if (!text && usableUploads.length === 0) {
       return;
     }
 
     if (!window.desktopApp?.solver?.solve) {
-      setErrorMessage('当前桌面环境没有暴露求解接口，请通过 Electron 启动应用。');
+      setErrorMessage('当前桌面环境没有可用的求解接口，请通过 Electron 启动应用。');
       return;
     }
 
     const requestId = createId('request');
+    const outgoingFiles: DesktopUploadedFileRef[] = usableUploads.map((file) => ({ path: file.path, name: file.name }));
+    const preparsedIngestResults: DesktopPreparedIngestResult[] = usableUploads
+      .filter((file): file is UploadItem & { ingestResult: DesktopIngestResult } => file.status === 'ready' && Boolean(file.ingestResult))
+      .map((file) => ({
+        path: file.path,
+        ingestResult: file.ingestResult,
+      }));
+    const parsingUploads = usableUploads.filter((file) => file.status === 'parsing' && file.parseRequestId);
+    const sessionWithUser = appendUserTurn(currentSession, {
+      text,
+      uploadedFiles: outgoingFiles,
+      mode,
+    });
+
+    setSessions((previous) => previous.map((session) => (session.id === currentSessionId ? sessionWithUser : session)));
+    setPendingAssistantSessionId(currentSessionId);
     setErrorMessage(null);
     setActiveResult(null);
     setActiveRequestId(requestId);
     setProgressEvents([]);
     setAppState('idle');
+    setInputText('');
+    setUploadedFiles([]);
+
+    for (const file of parsingUploads) {
+      void window.desktopApp?.solver?.cancelIngest?.(file.parseRequestId as string);
+    }
 
     try {
       const response = await window.desktopApp.solver.solve({
@@ -252,18 +367,17 @@ export default function App() {
         text,
         mode,
         settings,
-        uploadedFiles,
-        conversation: buildConversationContext(currentSession),
+        uploadedFiles: outgoingFiles,
+        preparsedIngestResults,
+        conversation: buildConversationContext(sessionWithUser),
+        agentPreviousResponseId: sessionWithUser.agentPreviousResponseId,
       });
 
-      handleAgentResponse(response, requestId, text);
-      setInputText('');
-      if (response.kind === 'solve') {
-        setUploadedFiles([]);
-      }
+      handleAgentResponse(response, requestId, currentSessionId);
     } catch (error) {
       const message = error instanceof Error ? error.message : '调用求解链失败，请检查 OpenAI 配置或本地脚本环境。';
       setErrorMessage(message);
+      setPendingAssistantSessionId((current) => (current === currentSessionId ? null : current));
       setActiveRequestId(null);
       setAppState('idle');
       setProgressEvents((previous) =>
@@ -291,10 +405,10 @@ export default function App() {
   const isBusy = activeRequestId !== null;
 
   return (
-    <div className="flex min-h-screen flex-col bg-[#f7f7f8] text-neutral-800 selection:bg-blue-500/30">
+    <div className="flex h-screen overflow-hidden flex-col bg-[#f7f7f8] text-neutral-800 selection:bg-blue-500/30">
       <Header state={appState} onOpenSettings={() => setSettingsOpen(true)} />
 
-      <main className="mx-auto grid min-h-0 w-full max-w-[1680px] flex-1 gap-6 px-4 py-5 lg:grid-cols-[248px_minmax(0,1fr)] lg:px-6">
+      <main className="mx-auto grid min-h-0 w-full max-w-[1680px] flex-1 gap-6 overflow-hidden px-4 py-5 lg:grid-cols-[248px_minmax(0,1fr)] lg:px-6">
         <HistorySidebar
           sessions={sessions}
           currentSessionId={currentSessionId}
@@ -303,9 +417,9 @@ export default function App() {
           onDeleteSession={handleDeleteSession}
         />
 
-        <section className="flex min-h-0 flex-col">
+        <section className="flex min-h-0 flex-col overflow-hidden">
           {appState === 'solving' && (
-            <div className="flex-1 rounded-[30px] border border-neutral-200 bg-white px-6 py-4 shadow-sm">
+            <div className="flex min-h-0 flex-1 overflow-y-auto rounded-[30px] border border-neutral-200 bg-white px-6 py-4 shadow-sm">
               <SolvingProcess events={progressEvents} />
             </div>
           )}
@@ -317,14 +431,9 @@ export default function App() {
           {appState === 'idle' && (
             <div className="flex min-h-0 flex-1 flex-col">
               {currentSession.turns.length === 0 ? (
-                <div className="flex flex-1 flex-col items-center justify-center">
+                <div className="flex flex-1 flex-col items-center justify-center overflow-y-auto">
                   <div className="w-full max-w-4xl">
-                    <h1 className="text-center text-[2.2rem] font-medium tracking-tight text-neutral-900">
-                      先聊天，agent 再决定是否调用求解 skill
-                    </h1>
-                    <p className="mx-auto mt-4 max-w-3xl text-center text-sm leading-6 text-neutral-500">
-                      这里不再默认把每条输入都当成求解请求。你可以像普通聊天一样提问；只有当模型判断需要使用上传实例解析、DRL 构造和局部搜索时，才会进入求解链。
-                    </p>
+                    <h1 className="text-center text-[2.2rem] font-medium tracking-tight text-neutral-900">你好，有什么我可以帮你的？</h1>
 
                     <div className="mt-8">
                       <InputArea
@@ -332,21 +441,17 @@ export default function App() {
                         mode={mode}
                         isBusy={isBusy}
                         isPickingFiles={isPickingFiles}
-                        selectedFileNames={uploadedFiles.map((file) => file.name)}
+                        selectedFiles={attachmentViewModels}
                         onChange={setInputText}
                         onModeChange={setMode}
                         onPickFiles={handlePickFiles}
-                        onRemoveSelectedFile={(index) =>
-                          setUploadedFiles((previous) => previous.filter((_, fileIndex) => fileIndex !== index))
-                        }
+                        onRemoveSelectedFile={handleRemoveSelectedFile}
                         onSubmit={handleSend}
                       />
                     </div>
 
                     {errorMessage && (
-                      <div className="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                        {errorMessage}
-                      </div>
+                      <div className="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>
                     )}
                   </div>
                 </div>
@@ -363,7 +468,11 @@ export default function App() {
                     </div>
                   </div>
 
-                  <ChatThread session={currentSession} onOpenResult={handleOpenResult} />
+                  <ChatThread
+                    session={currentSession}
+                    onOpenResult={handleOpenResult}
+                    isAssistantLoading={pendingAssistantSessionId === currentSession.id}
+                  />
 
                   <div className="mt-4 border-t border-neutral-100 pt-4">
                     <InputArea
@@ -371,20 +480,16 @@ export default function App() {
                       mode={mode}
                       isBusy={isBusy}
                       isPickingFiles={isPickingFiles}
-                      selectedFileNames={uploadedFiles.map((file) => file.name)}
+                      selectedFiles={attachmentViewModels}
                       onChange={setInputText}
                       onModeChange={setMode}
                       onPickFiles={handlePickFiles}
-                      onRemoveSelectedFile={(index) =>
-                        setUploadedFiles((previous) => previous.filter((_, fileIndex) => fileIndex !== index))
-                      }
+                      onRemoveSelectedFile={handleRemoveSelectedFile}
                       onSubmit={handleSend}
                     />
 
                     {errorMessage && (
-                      <div className="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                        {errorMessage}
-                      </div>
+                      <div className="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{errorMessage}</div>
                     )}
                   </div>
                 </div>

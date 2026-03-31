@@ -50,6 +50,9 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
   const view = useMemo(() => buildSolveViewModel(activeSolveResponse), [activeSolveResponse]);
   const payloadText = useMemo(() => JSON.stringify(activeSolveResponse.payload, null, 2), [activeSolveResponse.payload]);
   const ingestSummary = activeSolveResponse.ingestResult?.summary ?? null;
+  const finalAnalysis = activeSolveResponse.result.meta.final_analysis ?? null;
+  const longestRoute = (finalAnalysis?.hotspots?.longest_route as Record<string, unknown> | undefined) ?? undefined;
+  const maxWaitingStop = (finalAnalysis?.hotspots?.max_waiting_stop as Record<string, unknown> | undefined) ?? undefined;
 
   const handleExport = async () => {
     const payload = {
@@ -75,13 +78,13 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
   };
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-5">
+    <div className="flex min-w-0 min-h-0 flex-1 flex-col gap-5 overflow-y-auto pr-1">
       {isBatch && batchItems && (
         <div className="rounded-3xl border border-neutral-200 bg-white p-5 shadow-sm">
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="text-sm font-semibold text-neutral-900">批量实例列表</div>
-              <div className="mt-1 text-xs text-neutral-500">批量任务已并行提交，点击任一实例即可切换当前结果与地图。</div>
+              <div className="mt-1 text-xs text-neutral-500">点击实例可切换当前结果与地图。</div>
             </div>
             <div className="text-xs text-neutral-400">{batchItems.length} 个实例</div>
           </div>
@@ -116,17 +119,15 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
         </div>
       )}
 
-      <div className="grid min-h-0 flex-1 gap-5 xl:grid-cols-[340px_minmax(0,1fr)]">
-        <div className="min-h-0 overflow-y-auto pr-1">
+      <div className="grid gap-5 2xl:grid-cols-[360px_minmax(0,1fr)]">
+        <div className="min-w-0">
           <div className="space-y-4">
             <div className="rounded-3xl border border-neutral-200 bg-white p-5 shadow-sm">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <div className="text-lg font-semibold text-neutral-900">求解结果</div>
                   <div className="mt-1 text-sm text-neutral-500">
-                    {isBatch
-                      ? `本次共完成 ${batchItems?.length ?? 0} 个实例的批量求解。`
-                      : '可以继续查看地图、导出 JSON，或返回主对话继续提问。'}
+                    {isBatch ? `当前显示第 ${selectedBatchIndex + 1} 个实例结果。` : '可以继续查看地图、导出 JSON 或返回对话。'}
                   </div>
                 </div>
 
@@ -157,67 +158,82 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
                 </div>
               </div>
 
-              <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                <div>
-                  <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">{isBatch ? '批量规模' : '问题类型'}</div>
-                  <div className="mt-1 text-base font-semibold text-neutral-900">
-                    {isBatch ? `${batchItems?.length ?? 0} 个实例` : view.problemTypeLabel}
+              <div className="mt-5 grid gap-4 sm:grid-cols-2">
+                <div className="min-w-0">
+                  <div className="text-xs tracking-[0.16em] text-neutral-400">{isBatch ? '当前实例' : '问题类型'}</div>
+                  <div className="mt-1 break-all text-base font-semibold text-neutral-900">
+                    {isBatch ? activeItem?.fileName ?? '-' : view.problemTypeLabel}
                   </div>
                 </div>
-                <div>
-                  <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">求解模式</div>
-                  <div className="mt-1 text-base font-semibold text-neutral-900">{view.modeLabel}</div>
+                <div className="min-w-0">
+                  <div className="text-xs tracking-[0.16em] text-neutral-400">求解模式</div>
+                  <div className="mt-1 break-all text-base font-semibold text-neutral-900">{view.modeLabel}</div>
                 </div>
-                <div>
-                  <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">{isBatch ? '当前实例' : '输入来源'}</div>
-                  <div className="mt-1 text-base font-semibold text-neutral-900">{isBatch ? activeItem?.fileName ?? '-' : view.payloadSourceLabel}</div>
+                <div className="min-w-0">
+                  <div className="text-xs tracking-[0.16em] text-neutral-400">输入来源</div>
+                  <div className="mt-1 break-all text-base font-semibold text-neutral-900">
+                    {isBatch ? '批量上传' : view.payloadSourceLabel}
+                  </div>
                 </div>
-                <div>
-                  <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">耗时</div>
-                  <div className="mt-1 text-base font-semibold text-neutral-900">
+                <div className="min-w-0">
+                  <div className="text-xs tracking-[0.16em] text-neutral-400">耗时</div>
+                  <div className="mt-1 break-all text-base font-semibold text-neutral-900">
                     {((isBatch ? solveResponse.durationMs : activeSolveResponse.durationMs) / 1000).toFixed(2)} 秒
                   </div>
                 </div>
                 {ingestSummary && (
-                  <div>
-                    <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">识别格式</div>
-                    <div className="mt-1 text-base font-semibold text-neutral-900">{ingestSummary.detected_format}</div>
+                  <div className="min-w-0">
+                    <div className="text-xs tracking-[0.16em] text-neutral-400">识别格式</div>
+                    <div className="mt-1 break-all text-base font-semibold text-neutral-900">{ingestSummary.detected_format}</div>
                   </div>
                 )}
                 {ingestSummary && (
-                  <div>
-                    <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">节点数量</div>
-                    <div className="mt-1 text-base font-semibold text-neutral-900">{ingestSummary.node_count}</div>
-                  </div>
-                )}
-                {ingestSummary?.capacity !== undefined && (
-                  <div>
-                    <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">容量</div>
-                    <div className="mt-1 text-base font-semibold text-neutral-900">{ingestSummary.capacity}</div>
+                  <div className="min-w-0">
+                    <div className="text-xs tracking-[0.16em] text-neutral-400">节点数量</div>
+                    <div className="mt-1 break-all text-base font-semibold text-neutral-900">{ingestSummary.node_count}</div>
                   </div>
                 )}
               </div>
 
-              <div className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
-                <div className="flex items-center gap-2">
-                  <CheckCircle2 size={16} />
-                  {isBatch ? `当前实例最终距离：${formatNumber(view.finalDistance)}` : `最终距离：${formatNumber(view.finalDistance)}`}
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+                  <div className="flex items-center gap-2">
+                    <CheckCircle2 size={16} />
+                    最终距离：{formatNumber(view.finalDistance)}
+                  </div>
+                </div>
+                <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm text-neutral-700">
+                  车辆数量：<span className="font-semibold text-neutral-900">{view.finalVehicleCount}</span>
+                </div>
+                <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm text-neutral-700">
+                  广义目标值：
+                  <span className="font-semibold text-neutral-900">
+                    {view.finalGeneralizedCost === null ? ' - ' : ` ${formatNumber(view.finalGeneralizedCost)}`}
+                  </span>
+                </div>
+                <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm text-neutral-700">
+                  当前目标：<span className="font-semibold text-neutral-900">{view.objectiveSummary}</span>
                 </div>
               </div>
-            </div>
 
-            <div className="rounded-3xl border border-neutral-200 bg-white p-5 shadow-sm">
-              <div className="text-sm font-semibold text-neutral-900">求解过程</div>
-              <div className="mt-3 space-y-2.5">
-                {view.stageLines.map((line) => (
-                  <div key={line} className="rounded-2xl bg-neutral-50 px-4 py-3 text-sm text-neutral-700">
-                    {line}
+              {(longestRoute || maxWaitingStop) && (
+                <div className="mt-4 rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm text-neutral-700">
+                  <div className="font-medium text-neutral-900">热点摘要</div>
+                  <div className="mt-2 space-y-1">
+                    {longestRoute?.distance !== undefined && (
+                      <div>
+                        最长路线：路线 {String(longestRoute.route_index)}，距离 {formatNumber(Number(longestRoute.distance))}
+                      </div>
+                    )}
+                    {maxWaitingStop?.waiting_time !== undefined && (
+                      <div>
+                        最大等待点：路线 {String(maxWaitingStop.route_index)}，客户 {String(Number(maxWaitingStop.customer_index) + 1)}，
+                        等待 {formatNumber(Number(maxWaitingStop.waiting_time))}
+                      </div>
+                    )}
                   </div>
-                ))}
-              </div>
-              <div className="mt-3 text-sm text-neutral-500">
-                相比 DRL 初始解，总改进为 <span className="font-medium text-neutral-900">{formatNumber(view.improvement)}</span>。
-              </div>
+                </div>
+              )}
             </div>
 
             <details className="rounded-3xl border border-neutral-200 bg-white p-5 shadow-sm">
@@ -227,7 +243,7 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
           </div>
         </div>
 
-        <div className="min-h-[760px] overflow-hidden rounded-[30px] border border-neutral-200 bg-white shadow-sm">
+        <div className="min-w-0 overflow-hidden rounded-[30px] border border-neutral-200 bg-white shadow-sm h-[520px] sm:h-[580px] xl:h-[660px] 2xl:h-[760px]">
           <MapVisualization
             solveResponse={activeSolveResponse}
             highlightedRouteId={highlightedRouteId}
@@ -236,9 +252,8 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
         </div>
       </div>
 
-      <div className="rounded-3xl border border-neutral-200 bg-white p-5 shadow-sm">
+      <div className="relative rounded-3xl border border-neutral-200 bg-white p-5 shadow-sm">
         <div className="text-sm font-semibold text-neutral-900">路线明细</div>
-        <div className="mt-1 text-xs text-neutral-500">每行显示三条路线，悬停时会同步高亮地图中的对应路线。</div>
 
         <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {view.routes.map((route, index) => {
@@ -266,6 +281,20 @@ export function ResultView({ solveResponse, onBackToChat, onOpenNewChat }: Resul
               </button>
             );
           })}
+        </div>
+
+        <div className="mt-6 border-t border-neutral-100 pt-5">
+          <div className="text-sm font-semibold text-neutral-900">求解过程</div>
+          <div className="mt-4 flex flex-wrap gap-3">
+            {view.stageLines.map((line) => (
+              <div key={line} className="min-w-[240px] flex-1 rounded-2xl bg-neutral-50 px-4 py-3 text-sm text-neutral-700">
+                {line}
+              </div>
+            ))}
+            <div className="min-w-[240px] flex-1 rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm text-neutral-700">
+              相比 DRL 初始解，总距离改进为 <span className="font-medium text-neutral-900">{formatNumber(view.improvement)}</span>。
+            </div>
+          </div>
         </div>
       </div>
     </div>

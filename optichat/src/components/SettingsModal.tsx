@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { SlidersHorizontal, X } from 'lucide-react';
+import { KeyRound, SlidersHorizontal, X } from 'lucide-react';
 import { defaultSettings, sanitizeSettings } from '../lib/settings';
 import type { AppSettings } from '../types/settings';
 
@@ -58,6 +58,9 @@ export function SettingsModal({ isOpen, settings, onClose, onSave }: SettingsMod
     }
   };
 
+  const hasStoredKey = Boolean(settings.hasStoredOpenaiApiKey);
+  const keyTail = settings.openaiApiKeyLast4 ? `****${settings.openaiApiKeyLast4}` : '';
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-6">
       <div className="w-full max-w-3xl rounded-3xl border border-neutral-200 bg-white shadow-2xl">
@@ -68,7 +71,7 @@ export function SettingsModal({ isOpen, settings, onClose, onSave }: SettingsMod
             </div>
             <div>
               <h2 className="text-lg font-semibold text-neutral-900">设置</h2>
-              <p className="text-sm text-neutral-500">配置 OpenAI 连接以及本地求解链默认参数。</p>
+              <p className="text-sm text-neutral-500">配置 OpenAI 连接和默认求解参数。</p>
             </div>
           </div>
 
@@ -102,9 +105,19 @@ export function SettingsModal({ isOpen, settings, onClose, onSave }: SettingsMod
                 value={draft.openaiApiKey}
                 onChange={(event) => setDraft((previous) => ({ ...previous, openaiApiKey: event.target.value }))}
                 className="w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm text-neutral-900 outline-none transition-colors focus:border-neutral-400"
-                placeholder="sk-..."
+                placeholder={hasStoredKey ? '已保存，如需更换请重新输入' : 'sk-...'}
               />
             </label>
+
+            {hasStoredKey && !draft.openaiApiKey && (
+              <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs leading-6 text-emerald-700">
+                <div className="flex items-center gap-2 font-medium">
+                  <KeyRound size={14} />
+                  已保存 API key {keyTail || ''}
+                </div>
+                <div className="mt-1">留空保存不会清空当前 key，只有输入新的 key 才会覆盖。</div>
+              </div>
+            )}
 
             <label className="block space-y-2">
               <span className="text-sm font-medium text-neutral-700">模型</span>
@@ -112,13 +125,13 @@ export function SettingsModal({ isOpen, settings, onClose, onSave }: SettingsMod
                 value={draft.openaiModel}
                 onChange={(event) => setDraft((previous) => ({ ...previous, openaiModel: event.target.value }))}
                 className="w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm text-neutral-900 outline-none transition-colors focus:border-neutral-400"
-                placeholder="gpt-5.4-mini"
+                placeholder="gpt-5.4"
               />
             </label>
           </section>
 
           <section className="space-y-4">
-            <h3 className="text-sm font-semibold uppercase tracking-[0.16em] text-neutral-500">求解默认参数</h3>
+            <h3 className="text-sm font-semibold uppercase tracking-[0.16em] text-neutral-500">默认求解参数</h3>
 
             <label className="block space-y-2">
               <span className="text-sm font-medium text-neutral-700">DRL 采样数 K</span>
@@ -134,60 +147,83 @@ export function SettingsModal({ isOpen, settings, onClose, onSave }: SettingsMod
 
             <ToggleRow
               title="启用 Lookahead"
-              description="思考模式下在 DRL 初始解之后继续做 Lookahead。"
+              description="思考模式下启用 PolyNet 式解码期 lookahead。"
               checked={draft.enableLookahead}
               onChange={(checked) => setDraft((previous) => ({ ...previous, enableLookahead: checked }))}
             />
 
             <div className="grid grid-cols-2 gap-4">
               <label className="block space-y-2">
-                <span className="text-sm font-medium text-neutral-700">Lookahead 深度</span>
+                <span className="text-sm font-medium text-neutral-700">Lookahead Top-K</span>
                 <input
                   type="number"
                   min={1}
-                  max={5}
-                  value={draft.lookaheadDepth}
-                  onChange={(event) => setDraft((previous) => ({ ...previous, lookaheadDepth: Number(event.target.value) }))}
+                  max={32}
+                  value={draft.lookaheadTopK}
+                  onChange={(event) => setDraft((previous) => ({ ...previous, lookaheadTopK: Number(event.target.value) }))}
                   className="w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm text-neutral-900 outline-none transition-colors focus:border-neutral-400"
                 />
               </label>
 
               <label className="block space-y-2">
-                <span className="text-sm font-medium text-neutral-700">Beam 宽度</span>
+                <span className="text-sm font-medium text-neutral-700">置信概率阈值</span>
                 <input
                   type="number"
-                  min={1}
-                  max={64}
-                  value={draft.lookaheadBeamWidth}
-                  onChange={(event) => setDraft((previous) => ({ ...previous, lookaheadBeamWidth: Number(event.target.value) }))}
+                  min={0.5}
+                  max={0.999}
+                  step={0.01}
+                  value={draft.lookaheadConfidentProb}
+                  onChange={(event) =>
+                    setDraft((previous) => ({ ...previous, lookaheadConfidentProb: Number(event.target.value) }))
+                  }
                   className="w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm text-neutral-900 outline-none transition-colors focus:border-neutral-400"
                 />
               </label>
             </div>
 
             <ToggleRow
-              title="启用局部搜索"
-              description="思考模式下在 Lookahead 之后继续做局部搜索。"
+              title="思考模式启用改解"
+              description="控制 thinking 模式下是否继续做多轮局部搜索和破坏修复。"
               checked={draft.enableLocalSearch}
               onChange={(checked) => setDraft((previous) => ({ ...previous, enableLocalSearch: checked }))}
             />
 
-            <label className="block space-y-2">
-              <span className="text-sm font-medium text-neutral-700">局部搜索轮数</span>
-              <input
-                type="number"
-                min={1}
-                max={500}
-                value={draft.localSearchRounds}
-                onChange={(event) => setDraft((previous) => ({ ...previous, localSearchRounds: Number(event.target.value) }))}
-                className="w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm text-neutral-900 outline-none transition-colors focus:border-neutral-400"
-              />
-            </label>
+            <div className="grid grid-cols-2 gap-4">
+              <label className="block space-y-2">
+                <span className="text-sm font-medium text-neutral-700">Fast 改解轮数</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  value={draft.fastLocalSearchRounds}
+                  onChange={(event) =>
+                    setDraft((previous) => ({ ...previous, fastLocalSearchRounds: Number(event.target.value) }))
+                  }
+                  className="w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm text-neutral-900 outline-none transition-colors focus:border-neutral-400"
+                />
+              </label>
+
+              <label className="block space-y-2">
+                <span className="text-sm font-medium text-neutral-700">Thinking 改解轮数</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  value={draft.thinkingLocalSearchRounds}
+                  onChange={(event) =>
+                    setDraft((previous) => ({ ...previous, thinkingLocalSearchRounds: Number(event.target.value) }))
+                  }
+                  className="w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm text-neutral-900 outline-none transition-colors focus:border-neutral-400"
+                />
+              </label>
+            </div>
 
             <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-xs leading-6 text-neutral-500">
-              快速模式默认会做 8 个随机种子并行，每个种子内部使用 DRL k=128，并从结果中选最优。
+              Fast 模式默认是多 seed 的 DRL 构造，再做轻量局部搜索。
               <br />
-              思考模式默认使用单种子 DRL k=128，并继续执行 Lookahead；如果这里打开了局部搜索，也会继续衔接。
+              Thinking 模式默认先做 DRL k=128，再做 decode-time lookahead，然后让模型选择算子进行多轮改进。
+              <br />
+              Lookahead 的 Chunk Size 已固定为 256，不再暴露给用户修改。
             </div>
           </section>
         </div>

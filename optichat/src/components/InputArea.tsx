@@ -1,13 +1,20 @@
 import React from 'react';
-import { ArrowUp, Brain, CircleDashed, FileText, UploadCloud, X, Zap } from 'lucide-react';
+import { AlertCircle, ArrowUp, Brain, CircleDashed, FileText, UploadCloud, X, Zap } from 'lucide-react';
 import type { SolveMode } from '../types/solver';
+
+export type InputAttachmentItem = {
+  id: string;
+  name: string;
+  status: 'parsing' | 'ready' | 'error';
+  error?: string | null;
+};
 
 type InputAreaProps = {
   value: string;
   mode: SolveMode;
   isBusy: boolean;
   isPickingFiles: boolean;
-  selectedFileNames: string[];
+  selectedFiles: InputAttachmentItem[];
   onChange: (value: string) => void;
   onModeChange: (mode: SolveMode) => void;
   onPickFiles: () => Promise<void> | void;
@@ -20,15 +27,15 @@ export function InputArea({
   mode,
   isBusy,
   isPickingFiles,
-  selectedFileNames,
+  selectedFiles,
   onChange,
   onModeChange,
   onPickFiles,
   onRemoveSelectedFile,
   onSubmit,
 }: InputAreaProps) {
-  const canSubmit = Boolean(value.trim() || selectedFileNames.length > 0) && !isBusy;
-  const isProcessingSelectedFiles = isBusy && selectedFileNames.length > 0;
+  const hasUsableFiles = selectedFiles.some((file) => file.status !== 'error');
+  const canSubmit = Boolean(value.trim() || hasUsableFiles) && !isBusy;
 
   const handleSubmit = () => {
     if (canSubmit) {
@@ -39,23 +46,26 @@ export function InputArea({
   return (
     <div className="w-full">
       <div className="rounded-[28px] border border-neutral-200 bg-white shadow-sm transition-all duration-200 hover:border-neutral-300 focus-within:border-neutral-400 focus-within:shadow-md">
-        {(selectedFileNames.length > 0 || isPickingFiles) && (
+        {(selectedFiles.length > 0 || isPickingFiles) && (
           <div className="px-4 pt-4">
             <div className="flex flex-wrap gap-2">
               {isPickingFiles && (
                 <div className="inline-flex max-w-full items-center gap-2 rounded-2xl border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm text-neutral-700">
                   <CircleDashed size={16} className="shrink-0 animate-spin text-neutral-500" />
-                  <span className="max-w-[220px] truncate">正在导入实例...</span>
+                  <span className="max-w-[220px] truncate">正在选择文件...</span>
                 </div>
               )}
-              {selectedFileNames.map((fileName, index) => (
-                <div key={`${fileName}-${index}`} className="inline-flex max-w-full items-center gap-2 rounded-2xl border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm text-neutral-700">
-                  {isProcessingSelectedFiles ? (
+              {selectedFiles.map((file, index) => (
+                <div key={file.id} className="inline-flex max-w-full items-center gap-2 rounded-2xl border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm text-neutral-700">
+                  {file.status === 'parsing' ? (
                     <CircleDashed size={16} className="shrink-0 animate-spin text-neutral-500" />
+                  ) : file.status === 'error' ? (
+                    <AlertCircle size={16} className="shrink-0 text-red-500" />
                   ) : (
                     <FileText size={16} className="shrink-0 text-neutral-500" />
                   )}
-                  <span className="max-w-[220px] truncate">{fileName}</span>
+                  <span className="max-w-[220px] truncate">{file.name}</span>
+                  {file.status === 'error' && file.error ? <span className="max-w-[200px] truncate text-xs text-red-500">{file.error}</span> : null}
                   <button
                     onClick={() => onRemoveSelectedFile(index)}
                     disabled={isBusy}
@@ -92,7 +102,7 @@ export function InputArea({
               title="上传实例文件"
             >
               {isPickingFiles ? <CircleDashed size={18} className="animate-spin" /> : <UploadCloud size={18} />}
-              {isPickingFiles ? '导入中' : '上传文件'}
+              {isPickingFiles ? '选择中' : '上传文件'}
             </button>
 
             <button

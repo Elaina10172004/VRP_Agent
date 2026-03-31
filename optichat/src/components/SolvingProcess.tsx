@@ -103,7 +103,6 @@ export function SolvingProcess({ events }: SolvingProcessProps) {
     <div className="mx-auto flex h-full w-full max-w-3xl flex-col py-14">
       <div className="mb-10">
         <h2 className="text-2xl font-semibold text-neutral-900">处理中</h2>
-        <p className="mt-3 text-sm leading-6 text-neutral-500">这里展示的是后端真实返回的阶段事件，不再使用前端定时器模拟。</p>
       </div>
 
       <div className="rounded-[28px] border border-neutral-200 bg-neutral-50 px-5 py-5">

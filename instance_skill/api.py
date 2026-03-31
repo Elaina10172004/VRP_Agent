@@ -62,12 +62,6 @@ def _as_bool(value: str | int | float | bool | None) -> bool:
     return text in {"1", "true", "yes", "y", "depot"}
 
 
-def _grid_scale_for_vrptw(depot_xy: list[float], node_xy: list[list[float]], node_tw: list[list[float]]) -> float:
-    coordinate_max = max([abs(float(item)) for item in depot_xy] + [abs(float(value)) for point in node_xy for value in point] + [1.0])
-    time_max = max([abs(float(value)) for window in node_tw for value in window] + [1.0])
-    return float(max(coordinate_max, time_max, 1.0))
-
-
 def _normalize_json_payload(raw: dict) -> tuple[dict, str]:
     if "problem_type" in raw and "instance" in raw:
         payload = {
@@ -92,10 +86,8 @@ def _normalize_json_payload(raw: dict) -> tuple[dict, str]:
         if "node_tw" in raw:
             payload["instance"]["node_tw"] = raw["node_tw"]
             payload["instance"]["service_time"] = raw.get("service_time", 0)
-            payload["instance"]["grid_scale"] = raw.get(
-                "grid_scale",
-                _grid_scale_for_vrptw(raw["depot_xy"], raw["node_xy"], raw["node_tw"]),
-            )
+            if "grid_scale" in raw:
+                payload["instance"]["grid_scale"] = raw["grid_scale"]
         return payload, "json_instance"
 
     raise ValueError("JSON content is not a recognized solver payload or instance.")
@@ -144,7 +136,6 @@ def _parse_solomon_text(content: str) -> tuple[dict, str]:
         "capacity": capacity,
         "node_tw": node_tw,
         "service_time": service_time,
-        "grid_scale": _grid_scale_for_vrptw(depot_xy, node_xy, node_tw),
     }
     return {"problem_type": "cvrptw", "instance": instance}, "solomon_vrptw"
 
@@ -317,7 +308,6 @@ def _parse_csv_table(content: str) -> tuple[dict, str]:
             "capacity": capacity,
             "node_tw": node_tw,
             "service_time": service_time,
-            "grid_scale": _grid_scale_for_vrptw(depot_xy, node_xy, node_tw),
         }
         return {"problem_type": "cvrptw", "instance": instance}, "csv_cvrptw"
 

@@ -33,6 +33,7 @@ export type ChatSession = {
   title: string;
   createdAt: string;
   updatedAt: string;
+  agentPreviousResponseId: string | null;
   turns: ChatTurn[];
 };
 
@@ -54,6 +55,7 @@ export function createEmptySession(title = '新对话'): ChatSession {
     title,
     createdAt: now,
     updatedAt: now,
+    agentPreviousResponseId: null,
     turns: [],
   };
 }
@@ -74,45 +76,51 @@ function normalizeSession(input: unknown): ChatSession | null {
     title: typeof session.title === 'string' && session.title.trim() ? session.title : '新对话',
     createdAt: typeof session.createdAt === 'string' ? session.createdAt : new Date().toISOString(),
     updatedAt: typeof session.updatedAt === 'string' ? session.updatedAt : new Date().toISOString(),
-    turns: turns.map((turn) => {
-      if (!turn || typeof turn !== 'object') {
-        return null;
-      }
+    agentPreviousResponseId:
+      typeof session.agentPreviousResponseId === 'string' && session.agentPreviousResponseId.trim()
+        ? session.agentPreviousResponseId
+        : null,
+    turns: turns
+      .map((turn) => {
+        if (!turn || typeof turn !== 'object') {
+          return null;
+        }
 
-      const record = turn as Record<string, unknown>;
-      if (record.role === 'user') {
-        const legacyName =
-          typeof record.uploadedFileName === 'string' && record.uploadedFileName.trim() ? [record.uploadedFileName.trim()] : [];
+        const record = turn as Record<string, unknown>;
+        if (record.role === 'user') {
+          const legacyName =
+            typeof record.uploadedFileName === 'string' && record.uploadedFileName.trim() ? [record.uploadedFileName.trim()] : [];
+          return {
+            id: typeof record.id === 'string' ? record.id : createId('user'),
+            role: 'user' as const,
+            createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(),
+            text: typeof record.text === 'string' ? record.text : '',
+            uploadedFileNames: Array.isArray(record.uploadedFileNames)
+              ? record.uploadedFileNames.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+              : legacyName,
+            mode: record.mode === 'thinking' ? 'thinking' : 'quick',
+          };
+        }
+
+        if (record.role === 'assistant' && record.kind === 'solve' && record.solveResponse) {
+          return {
+            id: typeof record.id === 'string' ? record.id : createId('assistant-solve'),
+            role: 'assistant' as const,
+            kind: 'solve' as const,
+            createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(),
+            solveResponse: record.solveResponse as DesktopSolveResponse,
+          };
+        }
+
         return {
-          id: typeof record.id === 'string' ? record.id : createId('user'),
-          role: 'user' as const,
+          id: typeof record.id === 'string' ? record.id : createId('assistant-reply'),
+          role: 'assistant' as const,
+          kind: 'reply' as const,
           createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(),
           text: typeof record.text === 'string' ? record.text : '',
-          uploadedFileNames: Array.isArray(record.uploadedFileNames)
-            ? record.uploadedFileNames.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-            : legacyName,
-          mode: record.mode === 'thinking' ? 'thinking' : 'quick',
         };
-      }
-
-      if (record.role === 'assistant' && record.kind === 'solve' && record.solveResponse) {
-        return {
-          id: typeof record.id === 'string' ? record.id : createId('assistant-solve'),
-          role: 'assistant' as const,
-          kind: 'solve' as const,
-          createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(),
-          solveResponse: record.solveResponse as DesktopSolveResponse,
-        };
-      }
-
-      return {
-        id: typeof record.id === 'string' ? record.id : createId('assistant-reply'),
-        role: 'assistant' as const,
-        kind: 'reply' as const,
-        createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(),
-        text: typeof record.text === 'string' ? record.text : '',
-      };
-    }).filter((turn): turn is ChatTurn => turn !== null),
+      })
+      .filter((turn): turn is ChatTurn => turn !== null),
   };
 }
 
@@ -157,53 +165,44 @@ export function saveActiveSessionId(sessionId: string): void {
   window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, sessionId);
 }
 
-export function appendSolveTurn(
-  session: ChatSession,
-  input: { text: string; uploadedFiles?: DesktopUploadedFileRef[] | null; mode: SolveMode },
-  solveResponse: DesktopSolveResponse,
-): ChatSession {
-  const now = new Date().toISOString();
+function resolveAgentPreviousResponseId(nextValue: string | null | undefined, currentValue: string | null): string | null {
+  if (nextValue === undefined) {
+    return currentValue ?? null;
+  }
+  return nextValue;
+}
 
-  const userTurn: UserTurn = {
+function createUserTurn(input: { text: string; uploadedFiles?: DesktopUploadedFileRef[] | null; mode: SolveMode }, createdAt: string): UserTurn {
+  return {
     id: createId('user'),
     role: 'user',
-    createdAt: now,
+    createdAt,
     text: input.text,
     uploadedFileNames: input.uploadedFiles?.map((file) => file.name).filter(Boolean) ?? [],
     mode: input.mode,
   };
+}
 
-  const assistantTurn: AssistantSolveTurn = {
-    id: createId('assistant-solve'),
-    role: 'assistant',
-    kind: 'solve',
-    createdAt: now,
-    solveResponse,
-  };
+export function appendUserTurn(
+  session: ChatSession,
+  input: { text: string; uploadedFiles?: DesktopUploadedFileRef[] | null; mode: SolveMode },
+): ChatSession {
+  const now = new Date().toISOString();
+  const userTurn = createUserTurn(input, now);
 
   return {
     ...session,
     updatedAt: now,
-    turns: [...session.turns, userTurn, assistantTurn],
+    turns: [...session.turns, userTurn],
   };
 }
 
-export function appendReplyTurn(
+export function appendAssistantReplyMessage(
   session: ChatSession,
-  input: { text: string; uploadedFiles?: DesktopUploadedFileRef[] | null; mode: SolveMode },
   message: string,
+  agentPreviousResponseId?: string | null,
 ): ChatSession {
   const now = new Date().toISOString();
-
-  const userTurn: UserTurn = {
-    id: createId('user'),
-    role: 'user',
-    createdAt: now,
-    text: input.text,
-    uploadedFileNames: input.uploadedFiles?.map((file) => file.name).filter(Boolean) ?? [],
-    mode: input.mode,
-  };
-
   const assistantTurn: AssistantReplyTurn = {
     id: createId('assistant-reply'),
     role: 'assistant',
@@ -215,8 +214,49 @@ export function appendReplyTurn(
   return {
     ...session,
     updatedAt: now,
-    turns: [...session.turns, userTurn, assistantTurn],
+    agentPreviousResponseId: resolveAgentPreviousResponseId(agentPreviousResponseId, session.agentPreviousResponseId),
+    turns: [...session.turns, assistantTurn],
   };
+}
+
+export function appendAssistantSolveMessage(
+  session: ChatSession,
+  solveResponse: DesktopSolveResponse,
+  agentPreviousResponseId?: string | null,
+): ChatSession {
+  const now = new Date().toISOString();
+  const assistantTurn: AssistantSolveTurn = {
+    id: createId('assistant-solve'),
+    role: 'assistant',
+    kind: 'solve',
+    createdAt: now,
+    solveResponse,
+  };
+
+  return {
+    ...session,
+    updatedAt: now,
+    agentPreviousResponseId: resolveAgentPreviousResponseId(agentPreviousResponseId, session.agentPreviousResponseId),
+    turns: [...session.turns, assistantTurn],
+  };
+}
+
+export function appendSolveTurn(
+  session: ChatSession,
+  input: { text: string; uploadedFiles?: DesktopUploadedFileRef[] | null; mode: SolveMode },
+  solveResponse: DesktopSolveResponse,
+  agentPreviousResponseId?: string | null,
+): ChatSession {
+  return appendAssistantSolveMessage(appendUserTurn(session, input), solveResponse, agentPreviousResponseId);
+}
+
+export function appendReplyTurn(
+  session: ChatSession,
+  input: { text: string; uploadedFiles?: DesktopUploadedFileRef[] | null; mode: SolveMode },
+  message: string,
+  agentPreviousResponseId?: string | null,
+): ChatSession {
+  return appendAssistantReplyMessage(appendUserTurn(session, input), message, agentPreviousResponseId);
 }
 
 export function getLatestSolveResponse(session: ChatSession | null | undefined): DesktopSolveResponse | null {

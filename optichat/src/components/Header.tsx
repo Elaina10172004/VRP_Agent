@@ -14,7 +14,7 @@ const stateLabelMap: Record<string, string> = {
 
 export function Header({ state, onOpenSettings }: HeaderProps) {
   return (
-    <header className="flex h-16 items-center justify-between border-b border-neutral-200 bg-white px-6">
+    <header className="sticky top-0 z-40 flex h-16 shrink-0 items-center justify-between border-b border-neutral-200 bg-white/95 px-6 backdrop-blur">
       <div className="flex items-center gap-3">
         <div className="text-lg font-semibold tracking-wide text-neutral-900">OptiChat</div>
         <div className="rounded-full border border-neutral-200 bg-neutral-50 px-2.5 py-0.5 text-xs font-medium text-neutral-500">

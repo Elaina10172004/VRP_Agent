@@ -26,7 +26,7 @@ export function HistorySidebar({ sessions, currentSessionId, onSelectSession, on
   }, []);
 
   return (
-    <aside className="hidden min-h-0 bg-[#ececec] lg:flex lg:w-[252px] lg:flex-col">
+    <aside className="hidden min-h-0 self-start bg-[#ececec] lg:sticky lg:top-5 lg:flex lg:h-full lg:w-[252px] lg:flex-col">
       <div className="px-3 pb-3 pt-4">
         <button
           onClick={onCreateSession}
@@ -53,7 +53,7 @@ export function HistorySidebar({ sessions, currentSessionId, onSelectSession, on
                     isActive ? 'bg-white text-neutral-900' : 'text-neutral-700 hover:bg-white/70 hover:text-neutral-900'
                   }`}
                 >
-                  <span className="truncate block">{session.title || '新对话'}</span>
+                  <span className="block truncate">{session.title || '新对话'}</span>
                 </button>
 
                 <button

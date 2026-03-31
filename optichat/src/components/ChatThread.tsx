@@ -1,14 +1,15 @@
 import React, { useMemo } from 'react';
-import { FileText, Sparkles } from 'lucide-react';
+import { CircleDashed, FileText, Sparkles } from 'lucide-react';
 import { buildSolveViewModel } from '../lib/solverView';
 import type { AssistantSolveTurn, ChatSession } from '../lib/history';
 
 type ChatThreadProps = {
   session: ChatSession;
   onOpenResult: (turn: AssistantSolveTurn) => void;
+  isAssistantLoading?: boolean;
 };
 
-export function ChatThread({ session, onOpenResult }: ChatThreadProps) {
+export function ChatThread({ session, onOpenResult, isAssistantLoading = false }: ChatThreadProps) {
   const assistantViews = useMemo(() => {
     const mapping = new Map<string, ReturnType<typeof buildSolveViewModel>>();
     for (const turn of session.turns) {
@@ -110,6 +111,15 @@ export function ChatThread({ session, onOpenResult }: ChatThreadProps) {
             </div>
           );
         })}
+
+        {isAssistantLoading && (
+          <div className="max-w-[82%] rounded-[28px] rounded-bl-md border border-neutral-200 bg-white px-5 py-4 text-neutral-800 shadow-sm">
+            <div className="flex items-center gap-3 text-sm text-neutral-500">
+              <CircleDashed size={18} className="animate-spin" />
+              <span>正在思考…</span>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -8,6 +8,7 @@ export type SolverPayload = {
   problem_type: ProblemType;
   instance: Record<string, unknown>;
   config?: Record<string, unknown>;
+  starting_solution?: SolverSolution;
 };
 
 export type SolverSolution = {
@@ -23,14 +24,29 @@ export type SolverSolution = {
 
 export type SolverPipelineMeta = {
   mode: 'fast' | 'hybrid';
+  objective?: {
+    primary?: 'distance' | 'vehicle_count';
+    prioritize_vehicle_count?: boolean;
+    distance_weight?: number;
+    duration_weight?: number;
+    vehicle_fixed_cost?: number;
+    vehicle_count_weight?: number;
+    overtime_penalty?: number;
+    lateness_penalty?: number;
+    unserved_penalty?: number;
+  };
   drl_samples: number;
   seed_policy: string;
   seed_trials: number;
   candidate_count_per_seed: number;
   seed_candidate_distances?: number[] | null;
+  seed_candidate_scores?: number[] | null;
   enable_lookahead: boolean;
   lookahead_depth: number;
   lookahead_beam_width: number;
+  lookahead_top_k?: number;
+  lookahead_confident_prob?: number;
+  lookahead_uncertain_chunk_size?: number;
   lookahead_candidate_distances?: number[] | null;
   enable_local_search: boolean;
   local_search_rounds: number;
@@ -43,6 +59,29 @@ export type SolverPipelineMeta = {
     fast: number;
     hybrid: number;
   };
+  tool_plan?: string[];
+  tool_trace?: Array<Record<string, unknown>>;
+  final_validation?: Record<string, unknown>;
+  final_score?: {
+    generalized_cost: number;
+    vehicle_count: number;
+    distance: number;
+    duration: number;
+    ranking_key: number[];
+  };
+  final_analysis?: {
+    summary?: Record<string, unknown>;
+    routes?: Array<Record<string, unknown>>;
+    hotspots?: Record<string, unknown>;
+    objective?: Record<string, unknown>;
+  };
+  warmup_analysis?: {
+    summary?: Record<string, unknown>;
+    routes?: Array<Record<string, unknown>>;
+    hotspots?: Record<string, unknown>;
+    objective?: Record<string, unknown>;
+  };
+  refinement_strategy?: Record<string, unknown>;
 };
 
 export type SolverResult = {
@@ -59,6 +98,16 @@ export type DesktopUploadedFileRef = {
   name: string;
 };
 
+export type DesktopPreparedIngestResult = {
+  path: string;
+  ingestResult: DesktopIngestResult;
+};
+
+export type DesktopIngestRequest = {
+  requestId: string;
+  path: string;
+};
+
 export type ConversationTurn = {
   role: 'user' | 'assistant';
   content: string;
@@ -71,7 +120,9 @@ export type DesktopSolveRequest = {
   settings: AppSettings;
   uploadedFile?: DesktopUploadedFileRef | null;
   uploadedFiles?: DesktopUploadedFileRef[] | null;
+  preparsedIngestResults?: DesktopPreparedIngestResult[] | null;
   conversation?: ConversationTurn[];
+  agentPreviousResponseId?: string | null;
 };
 
 export type DesktopIngestResult = {
@@ -125,6 +176,7 @@ export type DesktopReplyResponse = {
   message: string;
   durationMs: number;
   suggestedTitle?: string | null;
+  agentPreviousResponseId?: string | null;
 };
 
 export type DesktopSolveSkillResponse = {
@@ -132,6 +184,7 @@ export type DesktopSolveSkillResponse = {
   solveResponse: DesktopSolveResponse;
   durationMs: number;
   suggestedTitle?: string | null;
+  agentPreviousResponseId?: string | null;
 };
 
 export type DesktopAgentResponse = DesktopReplyResponse | DesktopSolveSkillResponse;

@@ -16,6 +16,11 @@ Default DRL behavior is still `k=128` rollouts and selecting the best rollout, b
 
 All ranking now goes through `objective`, so construction selection, lookahead, and local search can optimize for more than pure distance.
 
+Current defaults:
+
+- `fast`: DRL construction plus lightweight local search (`two_opt`, `relocate`, `swap`)
+- `thinking`: lookahead first, then model-selected refinement operators and rounds
+
 ## CLI
 
 ```bash
@@ -61,7 +66,7 @@ python -m solver_skill.cli --input payload.json --output result.json --pretty
 }
 ```
 
-`mode="fast"` keeps the short path and returns the best DRL construction result directly.
+`mode="fast"` keeps a short path: DRL construction followed by lightweight local search.
 
 Supported objective fields:
 
@@ -72,3 +77,14 @@ Supported objective fields:
 - `overtime_penalty`
 - `lateness_penalty`
 - `unserved_penalty`
+
+## Analysis helpers
+
+To inspect a current solution before choosing more operators:
+
+```bash
+python -m tools.validate_solution --input payload.json --pretty
+python -m tools.analyze_solution --input payload.json --pretty
+```
+
+`tools.analyze_solution` reports per-route distance, generalized cost, load, longest route, and for CVRPTW also waiting-time hotspots.

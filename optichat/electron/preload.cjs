@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld('desktopApp', {
     saveJson: (request) => ipcRenderer.invoke('files:save-json', request),
   },
   solver: {
+    ingestFile: (request) => ipcRenderer.invoke('solver:ingest-file', request),
+    cancelIngest: (requestId) => ipcRenderer.invoke('solver:cancel-ingest', requestId),
     solve: (request) => ipcRenderer.invoke('solver:solve', request),
     onProgress: (callback) => {
       const listener = (_event, payload) => callback(payload);

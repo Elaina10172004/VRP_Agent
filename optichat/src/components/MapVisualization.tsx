@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { MousePointer2, Route } from 'lucide-react';
+import { MousePointer2 } from 'lucide-react';
 import { buildSolveViewModel } from '../lib/solverView';
 import type { DesktopSolveResponse } from '../types/solver';
 
@@ -42,7 +42,7 @@ function formatNumber(value: number): string {
 
 export function MapVisualization({ solveResponse, highlightedRouteId, onHighlightRoute }: MapVisualizationProps) {
   const xPadding = 72;
-  const yPadding = 132;
+  const yPadding = 188;
   const view = useMemo(() => buildSolveViewModel(solveResponse), [solveResponse]);
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
 
@@ -68,26 +68,28 @@ export function MapVisualization({ solveResponse, highlightedRouteId, onHighligh
 
   const hoveredNode = hoveredNodeId ? nodeLookup.get(hoveredNodeId) ?? null : null;
   const customerCount = view.nodes.filter((node) => !node.isDepot).length;
-  const routeCount = view.routes.length;
+  const generalizedCost = solveResponse.result.meta.final_score?.generalized_cost ?? null;
 
   return (
     <div className="flex h-full w-full flex-col bg-white">
-      <div className="grid gap-3 border-b border-neutral-200 bg-white px-4 py-3 md:grid-cols-4">
+      <div className="grid gap-3 border-b border-neutral-200 bg-white px-4 py-3 sm:grid-cols-2 2xl:grid-cols-4">
         <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3">
-          <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">最终距离</div>
+          <div className="text-xs tracking-[0.16em] text-neutral-400">最终距离</div>
           <div className="mt-1 text-xl font-semibold text-neutral-900">{formatNumber(view.finalDistance)}</div>
         </div>
         <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3">
-          <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">改进幅度</div>
-          <div className="mt-1 text-xl font-semibold text-neutral-900">{formatNumber(view.improvement)}</div>
+          <div className="text-xs tracking-[0.16em] text-neutral-400">车辆数量</div>
+          <div className="mt-1 text-xl font-semibold text-neutral-900">{view.finalVehicleCount}</div>
         </div>
         <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3">
-          <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">客户数量</div>
+          <div className="text-xs tracking-[0.16em] text-neutral-400">广义目标值</div>
+          <div className="mt-1 text-xl font-semibold text-neutral-900">
+            {generalizedCost === null ? '-' : formatNumber(generalizedCost)}
+          </div>
+        </div>
+        <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3">
+          <div className="text-xs tracking-[0.16em] text-neutral-400">客户数量</div>
           <div className="mt-1 text-xl font-semibold text-neutral-900">{customerCount}</div>
-        </div>
-        <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3">
-          <div className="text-xs uppercase tracking-[0.16em] text-neutral-400">路线数量</div>
-          <div className="mt-1 text-xl font-semibold text-neutral-900">{routeCount}</div>
         </div>
       </div>
 
@@ -97,22 +99,12 @@ export function MapVisualization({ solveResponse, highlightedRouteId, onHighligh
           style={{ backgroundImage: 'radial-gradient(circle at 2px 2px, black 1px, transparent 0)', backgroundSize: '34px 34px' }}
         />
 
-        <div className="absolute left-4 top-4 z-10 flex max-w-[320px] flex-col gap-3">
-          <div className="rounded-2xl border border-white/70 bg-white/88 px-4 py-3 shadow-sm backdrop-blur">
-            <div className="flex items-center gap-2 text-sm font-semibold text-neutral-900">
-              <Route size={16} />
-              路线高亮
-            </div>
-            <div className="mt-1 text-xs leading-5 text-neutral-500">将鼠标移到下方路线卡片或地图线段上，只强调当前路线。</div>
-          </div>
-
-          <div className="rounded-2xl border border-white/70 bg-white/88 px-4 py-3 shadow-sm backdrop-blur">
+        <div className="absolute left-4 top-4 z-10 flex max-w-[300px] flex-col gap-3">
+          <div className="rounded-2xl border border-white/70 bg-white/90 px-4 py-3 shadow-sm backdrop-blur">
             {hoveredNode ? (
               <div className="space-y-1.5 text-sm text-neutral-700">
                 <div className="font-semibold text-neutral-900">{hoveredNode.label}</div>
-                <div>
-                  坐标：({formatNumber(hoveredNode.x)}, {formatNumber(hoveredNode.y)})
-                </div>
+                <div>坐标：({formatNumber(hoveredNode.x)}, {formatNumber(hoveredNode.y)})</div>
                 {hoveredNode.demand !== null && <div>需求：{hoveredNode.demand}</div>}
                 {hoveredNode.timeWindow && <div>时间窗：[{hoveredNode.timeWindow[0]}, {hoveredNode.timeWindow[1]}]</div>}
               </div>

@@ -50,13 +50,44 @@ python -m instance_skill.cli --input-file <path> --pretty
   - `seed_trials=8`
   - `drl_samples=128`
   - no lookahead
-  - no local search by default
+  - lightweight local search by default: `two_opt`, `relocate`, `swap`
 - `thinking` mode:
   - `mode=hybrid`
   - `seed_trials=1`
   - `drl_samples=128`
   - lookahead enabled by default
-  - local search disabled by default
+  - after lookahead, let the model choose follow-up operators and refinement rounds
+
+## Objective extraction
+
+When the user states penalties or priorities in natural language, convert them into `objective` and pass that through the solver chain.
+
+Examples:
+
+- "优先减少车辆数" -> `"primary": "vehicle_count"`
+- "每多开一辆车罚 100" -> `"vehicle_fixed_cost": 100.0`
+- "迟到要重罚" -> `"lateness_penalty": ...`
+- "超时也要罚" -> `"overtime_penalty": ...`
+
+These objective fields affect candidate selection, lookahead ranking, and local-search / destroy-repair comparisons.
+
+## Analysis tools
+
+Use these tools when the model needs to inspect the current solution before deciding the next operator:
+
+```powershell
+python -m tools.validate_solution --input payload.json --pretty
+python -m tools.analyze_solution --input payload.json --pretty
+```
+
+`tools.analyze_solution` returns route-level diagnostics such as:
+
+- per-route distance
+- vehicle count
+- generalized cost
+- route load
+- longest route
+- for CVRPTW: total waiting time, max waiting time, and the longest-waiting customer
 
 ## Concurrency hints
 
@@ -70,3 +101,5 @@ These are reference values derived from earlier single-instance VRAM measurement
 - Recognition and canonical save: `instance_skill/api.py`
 - One-step uploaded-file solver: `instance_skill/solve_cli.py`
 - Main solve pipeline: `solver_skill/api.py`
+- Solution analysis: `tools/analyze_solution.py`
+- Feasibility validation: `tools/validate_solution.py`

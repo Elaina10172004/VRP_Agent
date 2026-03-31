@@ -20,9 +20,13 @@ from local_search.common import (
 from local_search.cvrp import reduce_cvrp_vehicle_count
 from local_search.cvrptw import reduce_cvrptw_vehicle_count
 from solver_core import CVRPSolver, CVRPTWSolver, TSPSolver
+from solver_core.cvrp_lookahead import solve_cvrp_with_decode_lookahead
+from solver_core.cvrptw_lookahead import solve_cvrptw_with_decode_lookahead
+from solver_core.solution_key import dedupe_solutions
+from solver_core.tsp_lookahead import solve_tsp_with_decode_lookahead
+from tools.analyze_solution import analyze_solution_parts
 from tools.validate_solution import validate_payload_solution_parts
-
-from .lookahead import apply_cvrp_lookahead, apply_cvrptw_lookahead, apply_tsp_lookahead
+from .elite_recombine import recombine_elite_candidates
 from .runtime_defaults import (
     FAST_DEFAULT_INSTANCE_PARALLELISM,
     FAST_SINGLE_INSTANCE_VRAM_MB,
@@ -35,7 +39,8 @@ from .runtime_defaults import (
 
 DEFAULT_LOOKAHEAD_OPERATORS = ["two_opt", "relocate", "swap"]
 DEFAULT_IMPROVEMENT_OPERATORS = ["or_opt", "two_opt_star", "cross_exchange", "relocate", "swap", "two_opt"]
-DEFAULT_DESTROY_REPAIR_OPERATORS = ["route_elimination", *DEFAULT_IMPROVEMENT_OPERATORS]
+DEFAULT_DESTROY_REPAIR_OPERATORS = ["shaw_regret", "route_elimination", *DEFAULT_IMPROVEMENT_OPERATORS]
+FAST_LIGHT_OPERATORS = ["two_opt", "relocate", "swap"]
 
 
 def _ensure_list(result: dict | list[dict] | list[list[dict]]) -> list[dict]:
@@ -207,19 +212,41 @@ def _score_with_validation(problem_type: str, instance: dict, solution: dict, va
 
 
 def _sort_candidates(problem_type: str, instance: dict, objective: dict, candidates: list[dict]) -> list[dict]:
+    unique_candidates = dedupe_solutions(problem_type, candidates)
     scored_items = []
-    for candidate in candidates:
+    for candidate in unique_candidates:
         validation = validate_solution(problem_type, instance, candidate)
         score = _score_with_validation(problem_type, instance, candidate, validation, objective)
-        scored_items.append(
-            {
-                "solution": candidate,
-                "validation": validation,
-                "score": score,
-            }
-        )
+        scored_items.append({"solution": candidate, "validation": validation, "score": score})
     scored_items.sort(key=lambda item: item["score"].ranking_key())
     return scored_items
+
+
+def _polish_recombined_solution(
+    problem_type: str,
+    instance: dict,
+    solution: dict,
+    objective: ObjectiveScore | dict,
+    config: dict,
+) -> dict:
+    polish_rounds = max(0, int(config.get("elite_recombine_polish_rounds", 8)))
+    if polish_rounds <= 0:
+        return solution
+    return improve_solution(
+        problem_type,
+        instance,
+        solution,
+        {
+            "local_search_rounds": polish_rounds,
+            "local_search_operators": config.get("local_search_operators", DEFAULT_IMPROVEMENT_OPERATORS),
+            "objective": objective.__dict__ if hasattr(objective, "__dict__") else objective,
+            "granular_neighbor_k": int(config.get("granular_neighbor_k", 20)),
+            "allow_worse_acceptance": False,
+            "regret_k": int(config.get("regret_k", 3)),
+            "shaw_remove_count": int(config.get("shaw_remove_count", 8)),
+        },
+        progress=None,
+    )
 
 
 def construct_initial(
@@ -229,8 +256,42 @@ def construct_initial(
     progress: Callable[[str, str, str | None], None] | None = None,
 ) -> dict:
     objective = normalize_objective_spec(config.get("objective"))
+    if bool(config.get("decode_lookahead_as_initial", False)):
+        _report_progress(progress, "seed", "Construct initial solution", "decode_time_lookahead")
+        best_solution = apply_lookahead_action(problem_type, instance, {}, config, progress=None)
+        validation = validate_solution(problem_type, instance, best_solution)
+        best_score = _score_with_validation(problem_type, instance, best_solution, validation, objective)
+        _report_progress(
+            progress,
+            "seed_done",
+            "Initial solution ready",
+            f"score={best_score.generalized_cost:.3f}, distance={best_score.distance:.3f}",
+        )
+        scored_item = {
+            "solution": best_solution,
+            "validation": validation,
+            "score": best_score,
+        }
+        return {
+            "candidates": [best_solution],
+            "scored_candidates": [scored_item],
+            "best_solution": best_solution,
+            "validation": validation,
+            "best_score": best_score,
+            "seed_trials": 1,
+            "candidate_count_per_seed": 1,
+        }
+
     seed_trials = max(1, int(config.get("seed_trials", 1)))
-    candidate_count_per_seed = max(1, int(config.get("initial_candidate_count", config.get("lookahead_k", 1))))
+    candidate_count_per_seed = max(
+        1,
+        int(
+            config.get(
+                "initial_candidate_count",
+                config.get("drl_samples", config.get("lookahead_k", 1)),
+            )
+        ),
+    )
 
     _report_progress(progress, "seed", "Construct initial solution", f"seed_trials={seed_trials}, topk={candidate_count_per_seed}")
     scored_candidates = _sort_candidates(
@@ -245,6 +306,22 @@ def construct_initial(
             candidate_count=candidate_count_per_seed,
         ),
     )
+    elite_recombine = recombine_elite_candidates(problem_type, instance, scored_candidates, config)
+    elite_recombine_item = None
+    if elite_recombine is not None:
+        elite_solution = elite_recombine["solution"]
+        elite_solution = _polish_recombined_solution(problem_type, instance, elite_solution, objective, config)
+        elite_recombine.setdefault("stats", {})["polish_rounds"] = max(0, int(config.get("elite_recombine_polish_rounds", 8)))
+        elite_validation = validate_solution(problem_type, instance, elite_solution)
+        elite_score = _score_with_validation(problem_type, instance, elite_solution, elite_validation, objective)
+        elite_recombine_item = {
+            "solution": elite_solution,
+            "validation": elite_validation,
+            "score": elite_score,
+            "stats": elite_recombine.get("stats", {}),
+        }
+        scored_candidates = sorted([*scored_candidates, elite_recombine_item], key=lambda item: item["score"].ranking_key())
+
     best_item = scored_candidates[0]
     _report_progress(
         progress,
@@ -260,6 +337,7 @@ def construct_initial(
         "best_score": best_item["score"],
         "seed_trials": seed_trials,
         "candidate_count_per_seed": candidate_count_per_seed,
+        "elite_recombine": elite_recombine_item,
     }
 
 
@@ -274,10 +352,13 @@ def apply_lookahead_action(
     config: dict,
     progress: Callable[[str, str, str | None], None] | None = None,
 ) -> dict:
+    top_k = int(config.get("lookahead_top_k", config.get("lookahead_depth", 3)))
+    confident_prob = float(config.get("lookahead_confident_prob", 0.95))
+    uncertain_chunk_size = int(config.get("lookahead_uncertain_chunk_size", config.get("lookahead_beam_width", 128)))
     lookahead_config = {
-        "depth": int(config.get("lookahead_depth", 2)),
-        "beam_width": int(config.get("lookahead_beam_width", 4)),
-        "per_operator_limit": int(config.get("lookahead_per_operator_limit", int(config.get("lookahead_beam_width", 4)))),
+        "top_k": top_k,
+        "confident_prob": confident_prob,
+        "uncertain_chunk_size": uncertain_chunk_size,
         "operators": config.get("lookahead_operators", config.get("operators", DEFAULT_LOOKAHEAD_OPERATORS)),
         "objective": config.get("objective"),
     }
@@ -286,20 +367,113 @@ def apply_lookahead_action(
         progress,
         "lookahead",
         "Run lookahead",
-        f"depth={lookahead_config['depth']}, beam={lookahead_config['beam_width']}",
+        f"top_k={lookahead_config['top_k']}, chunk={lookahead_config['uncertain_chunk_size']}",
     )
     if problem_type == "tsp":
-        improved = apply_tsp_lookahead(instance, solution, lookahead_config)
+        improved = solve_tsp_with_decode_lookahead(
+            instance["points"],
+            num_samples=int(config.get("drl_samples", 128)),
+            top_k=lookahead_config["top_k"],
+            confident_prob=lookahead_config["confident_prob"],
+            uncertain_chunk_size=lookahead_config["uncertain_chunk_size"],
+            objective=lookahead_config["objective"],
+            device=config.get("device"),
+        )
     elif problem_type == "cvrp":
-        improved = apply_cvrp_lookahead(instance, solution, lookahead_config)
+        improved = solve_cvrp_with_decode_lookahead(
+            instance["depot_xy"],
+            instance["node_xy"],
+            instance["node_demand"],
+            instance["capacity"],
+            num_samples=int(config.get("drl_samples", 128)),
+            top_k=lookahead_config["top_k"],
+            confident_prob=lookahead_config["confident_prob"],
+            uncertain_chunk_size=lookahead_config["uncertain_chunk_size"],
+            objective=lookahead_config["objective"],
+            device=config.get("device"),
+        )
     elif problem_type == "cvrptw":
-        improved = apply_cvrptw_lookahead(instance, solution, lookahead_config)
+        improved = solve_cvrptw_with_decode_lookahead(
+            instance["depot_xy"],
+            instance["node_xy"],
+            instance["node_demand"],
+            instance["capacity"],
+            instance["node_tw"],
+            instance["service_time"],
+            num_samples=int(config.get("drl_samples", 128)),
+            grid_scale=instance.get("grid_scale"),
+            top_k=lookahead_config["top_k"],
+            confident_prob=lookahead_config["confident_prob"],
+            uncertain_chunk_size=lookahead_config["uncertain_chunk_size"],
+            objective=lookahead_config["objective"],
+            device=config.get("device"),
+        )
     else:
         raise ValueError(f"Unsupported problem_type: {problem_type}")
 
     score = _score_solution(problem_type, instance, improved, lookahead_config["objective"])
     _report_progress(progress, "lookahead_done", "Lookahead finished", f"score={score.generalized_cost:.3f}")
     return improved
+
+
+def elite_guided_repair(
+    problem_type: str,
+    instance: dict,
+    solution: dict,
+    config: dict,
+    progress: Callable[[str, str, str | None], None] | None = None,
+) -> dict:
+    objective = normalize_objective_spec(config.get("objective"))
+    seed_trials = max(1, int(config.get("elite_guided_seed_trials", config.get("seed_trials", 1))))
+    candidate_count = max(
+        2,
+        int(
+            config.get(
+                "elite_guided_candidate_count",
+                config.get("initial_candidate_count", config.get("drl_samples", 128)),
+            )
+        ),
+    )
+    elite_config = {
+        **config,
+        "enable_elite_recombine": True,
+        "elite_pool_size": int(config.get("elite_guided_pool_size", config.get("elite_pool_size", 24))),
+        "elite_recombine_polish_rounds": int(
+            config.get("elite_guided_polish_rounds", config.get("elite_recombine_polish_rounds", 12))
+        ),
+    }
+    _report_progress(
+        progress,
+        "elite_guided_repair",
+        "Run elite-guided repair",
+        f"seed_trials={seed_trials}, topk={candidate_count}",
+    )
+    scored_candidates = _sort_candidates(
+        problem_type,
+        instance,
+        objective,
+        _build_seed_candidates(
+            problem_type,
+            instance,
+            config,
+            trial_count=seed_trials,
+            candidate_count=candidate_count,
+        ),
+    )
+    current_validation = validate_solution(problem_type, instance, solution)
+    current_score = _score_with_validation(problem_type, instance, solution, current_validation, objective)
+    scored_candidates.append({"solution": solution, "validation": current_validation, "score": current_score})
+    scored_candidates.sort(key=lambda item: item["score"].ranking_key())
+
+    elite_recombine = recombine_elite_candidates(problem_type, instance, scored_candidates, elite_config)
+    if elite_recombine is None:
+        _report_progress(progress, "elite_guided_repair_done", "Elite-guided repair finished", "no_consensus_candidate")
+        return solution
+
+    repaired = _polish_recombined_solution(problem_type, instance, elite_recombine["solution"], objective, elite_config)
+    score = _score_solution(problem_type, instance, repaired, objective)
+    _report_progress(progress, "elite_guided_repair_done", "Elite-guided repair finished", f"score={score.generalized_cost:.3f}")
+    return repaired
 
 
 def improve_solution(
@@ -313,6 +487,14 @@ def improve_solution(
         "max_rounds": int(config.get("local_search_rounds", 50)),
         "operators": config.get("local_search_operators", config.get("operators", DEFAULT_IMPROVEMENT_OPERATORS)),
         "objective": config.get("objective"),
+        "granular_neighbor_k": int(config.get("granular_neighbor_k", 20)),
+        "allow_worse_acceptance": bool(config.get("allow_worse_acceptance", False)),
+        "acceptance_budget": int(config.get("acceptance_budget", 0)),
+        "acceptance_temperature": float(config.get("acceptance_temperature", 0.01)),
+        "acceptance_decay": float(config.get("acceptance_decay", 0.9)),
+        "random_seed": int(config.get("random_seed", 0)),
+        "regret_k": int(config.get("regret_k", 3)),
+        "shaw_remove_count": int(config.get("shaw_remove_count", 8)),
     }
 
     _report_progress(progress, "local_search", "Run local search", f"rounds={ls_config['max_rounds']}")
@@ -341,6 +523,14 @@ def destroy_repair(
         "max_rounds": int(config.get("destroy_repair_rounds", config.get("local_search_rounds", 50))),
         "operators": config.get("destroy_repair_operators", DEFAULT_DESTROY_REPAIR_OPERATORS),
         "objective": config.get("objective"),
+        "granular_neighbor_k": int(config.get("granular_neighbor_k", 20)),
+        "allow_worse_acceptance": bool(config.get("allow_worse_acceptance", False)),
+        "acceptance_budget": int(config.get("acceptance_budget", 0)),
+        "acceptance_temperature": float(config.get("acceptance_temperature", 0.01)),
+        "acceptance_decay": float(config.get("acceptance_decay", 0.9)),
+        "random_seed": int(config.get("random_seed", 0)),
+        "regret_k": int(config.get("regret_k", 3)),
+        "shaw_remove_count": int(config.get("shaw_remove_count", 8)),
     }
 
     _report_progress(
@@ -375,6 +565,7 @@ def reduce_vehicles(
     reduction_config = {
         "max_rounds": int(config.get("vehicle_reduction_rounds", 10)),
         "objective": config.get("objective"),
+        "granular_neighbor_k": int(config.get("granular_neighbor_k", 20)),
     }
     _report_progress(progress, "reduce_vehicles", "Run route elimination", f"rounds={reduction_config['max_rounds']}")
     if problem_type == "cvrp":
@@ -399,7 +590,7 @@ def compare_solutions(problem_type: str, instance: dict, solutions: list[dict], 
 
     objective = normalize_objective_spec((config or {}).get("objective"))
     comparisons = []
-    for solution in solutions:
+    for solution in dedupe_solutions(problem_type, solutions):
         validation = validate_solution(problem_type, instance, solution)
         score = _score_with_validation(problem_type, instance, solution, validation, objective)
         comparisons.append(
@@ -421,17 +612,19 @@ def compare_solutions(problem_type: str, instance: dict, solutions: list[dict], 
 
 def _default_tool_plan(config: dict, fast_mode: bool) -> list[str]:
     if fast_mode:
-        return ["construct_initial", "validate_solution", "compare_solutions"]
+        return ["construct_initial", "validate_solution", "improve_solution", "validate_solution", "compare_solutions"]
 
     plan = ["construct_initial", "validate_solution"]
-    if bool(config.get("enable_vehicle_reduction", False)):
-        plan.extend(["reduce_vehicles", "validate_solution"])
     if bool(config.get("enable_lookahead", True)):
         plan.extend(["apply_lookahead", "validate_solution"])
-    if bool(config.get("enable_destroy_repair", False)):
-        plan.extend(["destroy_repair", "validate_solution"])
+    if bool(config.get("enable_elite_guided_repair", False)):
+        plan.extend(["elite_guided_repair", "validate_solution"])
+    if bool(config.get("enable_vehicle_reduction", False)):
+        plan.extend(["reduce_vehicles", "validate_solution"])
     if bool(config.get("enable_local_search", False)):
         plan.extend(["improve_solution", "validate_solution"])
+    if bool(config.get("enable_destroy_repair", False)):
+        plan.extend(["destroy_repair", "validate_solution", "improve_solution", "validate_solution"])
     plan.append("compare_solutions")
     return plan
 
@@ -439,6 +632,7 @@ def _default_tool_plan(config: dict, fast_mode: bool) -> list[str]:
 def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None] | None = None) -> dict:
     problem_type = str(payload.get("problem_type", "")).strip().lower()
     instance = payload.get("instance")
+    starting_solution = payload.get("starting_solution") if isinstance(payload.get("starting_solution"), dict) else None
     config = dict(payload.get("config", {}))
     if not isinstance(instance, dict):
         raise ValueError("Payload must contain an 'instance' object.")
@@ -449,27 +643,78 @@ def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None
     config["objective"] = objective.__dict__
     config.setdefault("seed_trials", 8 if fast_mode else 1)
     config.setdefault("enable_lookahead", not fast_mode)
-    config.setdefault("enable_local_search", False)
+    config.setdefault("enable_local_search", True)
+    config.setdefault("enable_destroy_repair", False if fast_mode else True)
+    config.setdefault("enable_elite_guided_repair", False)
+    config.setdefault("local_search_rounds", 8 if fast_mode else 50)
+    config.setdefault("local_search_operators", FAST_LIGHT_OPERATORS if fast_mode else DEFAULT_IMPROVEMENT_OPERATORS)
+    config.setdefault("destroy_repair_operators", DEFAULT_DESTROY_REPAIR_OPERATORS)
+    config.setdefault("granular_neighbor_k", 16 if fast_mode else 24)
+    config.setdefault("regret_k", 3)
+    config.setdefault("shaw_remove_count", 4 if fast_mode else 8)
+    config.setdefault("enable_elite_recombine", True)
+    config.setdefault("elite_pool_size", 32 if fast_mode else 24)
+    config.setdefault("elite_recombine_polish_rounds", 8 if fast_mode else 12)
+    config.setdefault("elite_guided_pool_size", 24)
+    config.setdefault("elite_guided_polish_rounds", 12)
+    config.setdefault("elite_guided_seed_trials", 1)
+    config.setdefault("elite_guided_candidate_count", int(config.get("drl_samples", 128)))
+    config.setdefault("enable_multistart_local_search", fast_mode)
+    config.setdefault("multistart_local_search_candidates", 2 if fast_mode else 1)
+    config.setdefault("enable_multistart_refinement", not fast_mode)
+    config.setdefault("multistart_refinement_candidates", 2 if not fast_mode else 1)
+    config.setdefault("allow_worse_acceptance", not fast_mode)
+    config.setdefault("acceptance_budget", 0 if fast_mode else max(2, int(config["local_search_rounds"]) // 6))
+    config.setdefault("acceptance_temperature", 0.01)
+    config.setdefault("acceptance_decay", 0.9)
+    config.setdefault("random_seed", 0)
 
     tool_plan = list(config.get("tool_plan", _default_tool_plan(config, fast_mode)))
     trace: list[dict] = []
 
-    construction = construct_initial(problem_type, instance, config, progress=progress)
-    seed_candidates = construction["candidates"]
-    scored_seed_candidates = construction["scored_candidates"]
-    seed_solution = construction["best_solution"]
-    current_solution = seed_solution
-    current_validation = construction["validation"]
-    current_score = construction["best_score"]
-    trace.append(
-        {
-            "action": "construct_initial",
-            "validation": current_validation,
-            "score": current_score.generalized_cost,
-            "vehicle_count": current_score.vehicle_count,
-            "distance": current_score.distance,
+    if starting_solution is not None:
+        seed_solution = starting_solution
+        seed_candidates = [starting_solution]
+        current_solution = starting_solution
+        current_validation = validate_solution(problem_type, instance, current_solution)
+        current_score = _score_with_validation(problem_type, instance, current_solution, current_validation, objective)
+        scored_seed_candidates = [
+            {
+                "solution": starting_solution,
+                "validation": current_validation,
+                "score": current_score,
+            }
+        ]
+        construction = {
+            "seed_trials": 0,
+            "candidate_count_per_seed": 1,
         }
-    )
+        trace.append(
+            {
+                "action": "use_starting_solution",
+                "validation": current_validation,
+                "score": current_score.generalized_cost,
+                "vehicle_count": current_score.vehicle_count,
+                "distance": current_score.distance,
+            }
+        )
+    else:
+        construction = construct_initial(problem_type, instance, config, progress=progress)
+        seed_candidates = construction["candidates"]
+        scored_seed_candidates = construction["scored_candidates"]
+        seed_solution = construction["best_solution"]
+        current_solution = seed_solution
+        current_validation = construction["validation"]
+        current_score = construction["best_score"]
+        trace.append(
+            {
+                "action": "construct_initial",
+                "validation": current_validation,
+                "score": current_score.generalized_cost,
+                "vehicle_count": current_score.vehicle_count,
+                "distance": current_score.distance,
+            }
+        )
 
     lookahead_solution = None
     local_search_solution = None
@@ -524,13 +769,13 @@ def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None
                 }
             )
             continue
-        if action == "destroy_repair":
-            repaired = destroy_repair(problem_type, instance, current_solution, config, progress=progress)
-            compared = compare_solutions(problem_type, instance, [current_solution, repaired], config)
+        if action == "elite_guided_repair":
+            guided = elite_guided_repair(problem_type, instance, current_solution, config, progress=progress)
+            compared = compare_solutions(problem_type, instance, [current_solution, guided], config)
             current_solution = compared["best_solution"]
             current_validation = compared["best_validation"]
             current_score = compared["best_score"]
-            comparison_candidates.append(repaired)
+            comparison_candidates.append(guided)
             trace.append(
                 {
                     "action": action,
@@ -540,20 +785,55 @@ def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None
                 }
             )
             continue
-        if action == "improve_solution":
-            improved = improve_solution(problem_type, instance, current_solution, config, progress=progress)
-            local_search_solution = improved
-            compared = compare_solutions(problem_type, instance, [current_solution, improved], config)
+        if action == "destroy_repair":
+            destroy_repair_starts = [current_solution]
+            if bool(config.get("enable_multistart_refinement", False)) and not fast_mode:
+                destroy_repair_starts.extend(comparison_candidates[: max(1, int(config.get("multistart_refinement_candidates", 2)))])
+            unique_destroy_starts = dedupe_solutions(problem_type, destroy_repair_starts)
+            repaired_solutions = [destroy_repair(problem_type, instance, start_solution, config, progress=progress) for start_solution in unique_destroy_starts]
+            compared = compare_solutions(problem_type, instance, [current_solution, *repaired_solutions], config)
             current_solution = compared["best_solution"]
             current_validation = compared["best_validation"]
             current_score = compared["best_score"]
-            comparison_candidates.append(improved)
+            comparison_candidates.extend(repaired_solutions)
             trace.append(
                 {
                     "action": action,
                     "score": current_score.generalized_cost,
                     "vehicle_count": current_score.vehicle_count,
                     "distance": current_score.distance,
+                    "start_count": len(unique_destroy_starts),
+                }
+            )
+            continue
+        if action == "improve_solution":
+            local_search_starts = [current_solution]
+            if construction.get("elite_recombine") is not None and bool(config.get("enable_elite_recombine", True)):
+                local_search_starts.append(construction["elite_recombine"]["solution"])
+            if bool(config.get("enable_multistart_local_search", fast_mode)):
+                extra_starts = [
+                    item["solution"]
+                    for item in construction.get("scored_candidates", [])[: max(1, int(config.get("multistart_local_search_candidates", 2)))]
+                ]
+                local_search_starts.extend(extra_starts)
+            if bool(config.get("enable_multistart_refinement", False)) and not fast_mode:
+                local_search_starts.extend(comparison_candidates[: max(1, int(config.get("multistart_refinement_candidates", 2)))])
+
+            unique_starts = dedupe_solutions(problem_type, local_search_starts)
+            improved_solutions = [improve_solution(problem_type, instance, start_solution, config, progress=progress) for start_solution in unique_starts]
+            local_search_solution = improved_solutions[0] if improved_solutions else current_solution
+            compared = compare_solutions(problem_type, instance, [current_solution, *improved_solutions], config)
+            current_solution = compared["best_solution"]
+            current_validation = compared["best_validation"]
+            current_score = compared["best_score"]
+            comparison_candidates.extend(improved_solutions)
+            trace.append(
+                {
+                    "action": action,
+                    "score": current_score.generalized_cost,
+                    "vehicle_count": current_score.vehicle_count,
+                    "distance": current_score.distance,
+                    "start_count": len(unique_starts),
                 }
             )
             continue
@@ -573,6 +853,7 @@ def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None
             continue
 
     _report_progress(progress, "finalize", "Finalize solution", f"score={current_score.generalized_cost:.3f}")
+    final_analysis = analyze_solution_parts(problem_type, instance, current_solution, objective.__dict__)
 
     return {
         "problem_type": problem_type,
@@ -589,12 +870,51 @@ def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None
             "candidate_count_per_seed": construction["candidate_count_per_seed"],
             "seed_candidate_distances": _candidate_distances(seed_candidates),
             "seed_candidate_scores": _candidate_scores(scored_seed_candidates),
+            "elite_recombine": {
+                "enabled": bool(config.get("enable_elite_recombine", True)),
+                "applied": construction.get("elite_recombine") is not None,
+                "score": (
+                    construction["elite_recombine"]["score"].generalized_cost
+                    if construction.get("elite_recombine") is not None
+                    else None
+                ),
+                "distance": (
+                    construction["elite_recombine"]["score"].distance
+                    if construction.get("elite_recombine") is not None
+                    else None
+                ),
+                "stats": construction.get("elite_recombine", {}).get("stats", {}) if construction.get("elite_recombine") else {},
+            },
             "enable_lookahead": bool(config.get("enable_lookahead", False)) and not fast_mode,
-            "lookahead_depth": int(config.get("lookahead_depth", 2)),
-            "lookahead_beam_width": int(config.get("lookahead_beam_width", 4)),
+            "lookahead_depth": int(config.get("lookahead_depth", 3)),
+            "lookahead_beam_width": int(config.get("lookahead_beam_width", 128)),
+            "lookahead_top_k": int(config.get("lookahead_top_k", config.get("lookahead_depth", 3))),
+            "lookahead_confident_prob": float(config.get("lookahead_confident_prob", 0.95)),
+            "lookahead_uncertain_chunk_size": int(config.get("lookahead_uncertain_chunk_size", config.get("lookahead_beam_width", 128))),
             "lookahead_candidate_distances": _candidate_distances([lookahead_solution] if lookahead_solution else None),
-            "enable_local_search": bool(config.get("enable_local_search", False)) and not fast_mode,
+            "enable_local_search": bool(config.get("enable_local_search", False)),
             "local_search_rounds": int(config.get("local_search_rounds", 50)),
+            "local_search_operators": list(config.get("local_search_operators", [])),
+            "destroy_repair_operators": list(config.get("destroy_repair_operators", [])),
+            "granular_neighbor_k": int(config.get("granular_neighbor_k", 20)),
+            "regret_k": int(config.get("regret_k", 3)),
+            "shaw_remove_count": int(config.get("shaw_remove_count", 8)),
+            "enable_elite_recombine": bool(config.get("enable_elite_recombine", True)),
+            "elite_pool_size": int(config.get("elite_pool_size", 24)),
+            "elite_recombine_polish_rounds": int(config.get("elite_recombine_polish_rounds", 8)),
+            "enable_elite_guided_repair": bool(config.get("enable_elite_guided_repair", False)),
+            "elite_guided_pool_size": int(config.get("elite_guided_pool_size", 24)),
+            "elite_guided_polish_rounds": int(config.get("elite_guided_polish_rounds", 12)),
+            "elite_guided_seed_trials": int(config.get("elite_guided_seed_trials", 1)),
+            "elite_guided_candidate_count": int(config.get("elite_guided_candidate_count", config.get("drl_samples", 128))),
+            "enable_multistart_local_search": bool(config.get("enable_multistart_local_search", False)),
+            "multistart_local_search_candidates": int(config.get("multistart_local_search_candidates", 1)),
+            "enable_multistart_refinement": bool(config.get("enable_multistart_refinement", False)),
+            "multistart_refinement_candidates": int(config.get("multistart_refinement_candidates", 1)),
+            "allow_worse_acceptance": bool(config.get("allow_worse_acceptance", False)),
+            "acceptance_budget": int(config.get("acceptance_budget", 0)),
+            "acceptance_temperature": float(config.get("acceptance_temperature", 0.01)),
+            "acceptance_decay": float(config.get("acceptance_decay", 0.9)),
             "local_search_candidate_distances": _candidate_distances([local_search_solution] if local_search_solution else None),
             "gpu_budget_mb": GPU_BUDGET_MB,
             "fast_single_instance_vram_mb": FAST_SINGLE_INSTANCE_VRAM_MB,
@@ -614,6 +934,7 @@ def solve_payload(payload: dict, progress: Callable[[str, str, str | None], None
                 "duration": current_score.duration,
                 "ranking_key": list(current_score.ranking_key()),
             },
+            "final_analysis": final_analysis,
             "runtime_defaults": build_runtime_defaults_payload(),
         },
     }
